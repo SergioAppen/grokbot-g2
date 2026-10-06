@@ -146,7 +146,8 @@ status() {
     if alive $p; then echo "$p: running (pgid $(cat run/$p.pid))"; elif [[ $p != mock* && $p != cloudflared ]]; then echo "$p: stopped"; fi
   done
   if [ "$TUNNEL_MODE" = tailscale-funnel ]; then
-    if ts status >/dev/null 2>&1; then echo "tailscale: up"; ts funnel status 2>/dev/null | grep -E "https://|proxy" | sed 's/^/  /'; else echo "tailscale: DOWN"; fi
+    if ts_logged_in; then echo "tailscale: up"; ts funnel status 2>/dev/null | grep -E "https://|proxy" | sed 's/^/  /'
+    elif ts_running; then echo "tailscale: running, NOT logged in (./run.sh ts-login)"; else echo "tailscale: DOWN"; fi
   fi
   printf "local  /health: "; curl -s -m 5 "http://127.0.0.1:$RELAY_PORT/health" || printf "unreachable"; echo
   [ -n "${RELAY_PUBLIC_URL:-}" ] && { printf "public /health: "; curl -s -m 15 "$RELAY_PUBLIC_URL/health" || printf "unreachable"; echo; }

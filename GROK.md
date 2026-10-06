@@ -62,7 +62,7 @@ curl --version | head -1
 - **Node too old or missing, no root:** install Node 22 *next to* the system one and point `.env` at it:
   ```bash
   V=$(curl -s https://nodejs.org/dist/index.json | python3 -c 'import json,sys;print(next(r["version"] for r in json.load(sys.stdin) if r["version"].startswith("v22.")))')
-  mkdir -p .node && curl -fsSL "https://nodejs.org/dist/$V/node-$V-linux-x64.tar.xz" | tar -xJ -C .node --strip-components=1
+  mkdir -p .node && curl -fsSL "https://nodejs.org/dist/$V/node-$V-linux-x64.tar.gz" | tar -xz -C .node --strip-components=1
   .node/bin/node -v
   ```
   Then (after step 2 created `.env`) set `NODE_BIN_DIR=$PWD/.node/bin` in `.env`. Don't replace the system node.
@@ -172,7 +172,8 @@ its HTTPS certificate and the URL fails with a TLS error. Manual equivalent for 
 ```
 
 It starts `tailscaled` if needed, runs `tailscale up --hostname=$TAILSCALE_HOSTNAME` in the background and
-prints a `https://login.tailscale.com/…` link. Send the link to the user; they sign in and approve the machine.
+prints a `https://login.tailscale.com/…` link (within ~10 s). Until the user signs in, `./run.sh status` shows
+`tailscale: running, NOT logged in` and `./run.sh start` stops with a hint instead of starting anything. Send the link to the user; they sign in and approve the machine.
 Run `./run.sh ts-login` again: once logged in it prints `Relay URL: https://<host>.<tailnet>.ts.net`.
 
 - Find the hostname any time: `./tailscale/tailscale --socket=tailscale/state/tailscaled.sock status --json |
@@ -186,7 +187,8 @@ it, enables HTTPS certificates and Funnel for the node, then you rerun `./run.sh
 `./run.sh status`: it shows `tailscale: up` and the `https://… proxy http://127.0.0.1:8787` line.
 
 `./run.sh start` always brings up both `tailscaled` (if `TAILSCALED_BIN` is set) and Funnel, so after a reboot a
-single `./run.sh start` is enough. `./run.sh stop` leaves Tailscale running.
+single `./run.sh start` is enough. `./run.sh stop` leaves Tailscale running; to stop the `tailscaled` that
+`run.sh` started: `kill -- -$(cat run/tailscaled.pid)` (only that process group).
 
 ### 7. App manifest whitelist (`app/app.json`)
 
@@ -224,8 +226,10 @@ trailing slash, no path).
    developer section appears top-right in the Even Hub tab). There is no toggle.
 2. **Project / package id.** In the portal they create a project for the package id in `app/app.json`
    (`package_id`, from `APP_PACKAGE_ID`). It must be globally unique, lowercase letters/digits and dots only,
-   and is permanent once released. `cd app && npx evenhub pack app.json dist -o /tmp/check.ehpk -c` checks
-   availability. If it's taken, pick another, set `APP_PACKAGE_ID`, `./run.sh build`.
+   and is permanent once released. If the upload says the id is taken, pick another, set `APP_PACKAGE_ID`,
+   `./run.sh build`. (`cd app && npx evenhub pack app.json dist -o /tmp/check.ehpk -c` checks availability
+   up front, but only after `npx evenhub login` with the user's Even Hub account; without it, it prints
+   `Not authenticated`. Let the user type their own credentials, or skip the check.)
 3. **Give them the file:** `app/grokbot-g2.ehpk` (copy it to their computer or tell them the path).
 4. **Choose how to install:**
 
@@ -297,8 +301,10 @@ tools/sim.sh stop; ./run.sh mock stop
 ```
 
 - Glasses screenshots keep brightness in the alpha channel; `tools/hudview.py` writes a viewable `_view.png`.
-- Add `?debug` to the app URL (`tools/sim.sh start 'http://127.0.0.1:8799/app/?debug'`) to log every HUD
-  update to the console (`GET localhost:9898/api/console?since_id=0`).
+- `tools/sim.sh start` opens `http://127.0.0.1:8799/app/#relay=http://127.0.0.1:8799`; the `#relay=` part makes
+  the app use the mock relay even if `./run.sh build` baked your real relay URL into `app/.env.production`.
+- Add `?debug` to log every HUD update to the console (`GET localhost:9898/api/console?since_id=0`):
+  `tools/sim.sh start 'http://127.0.0.1:8799/app/?debug#relay=http://127.0.0.1:8799'`.
 - In the mock, a message containing "long" returns one ~3000-character reply (pagination test); others get a
   3-message reply over 12 s.
 
