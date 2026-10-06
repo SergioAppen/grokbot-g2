@@ -20,7 +20,7 @@ code.
    plain chat. If the user pastes a secret into chat anyway, store it and tell them to rotate it later.
 3. **The Cursor API key is relay-only.** It goes into `.env` (`CURSOR_API_KEY`) and nowhere else. The app has
    no field for it and the relay has no endpoint that reads or writes it; don't add one. STT keys (ElevenLabs,
-   xAI) may be set either in `.env` or by the user in the app (**Settings → Voice**, write-only).
+   xAI) may be set either in `.env` or by the user in the app (**⚙ Settings → Voice**, write-only).
 4. **Only kill processes you started.** Use `./run.sh stop|restart-relay|reload-relay|mock stop`, which only
    signal the process groups recorded in `run/*.pid`. Never `pkill node`, never `pkill -f` with a pattern that
    could match other agents' processes or your own shell, and never stop a Tailscale or cloudflared that you
@@ -43,7 +43,7 @@ code.
 |---|---|---|
 | Cursor API key for the account that owns their Grok Bots | Cursor dashboard → API keys | secure secret request → `CURSOR_API_KEY` in `.env` |
 | Exact names of the bots for the glasses (and the default one) | Grok Bot app, or agent `profile.json` files (step 3) | plain chat → `bots.json`, `DEFAULT_BOT` |
-| STT: ElevenLabs key and/or xAI key, or OK to run Whisper locally | elevenlabs.io → API keys; console.x.ai → API keys | they can paste keys in the app later (**Settings → Voice**), or secure request → `.env` |
+| STT: ElevenLabs key and/or xAI key, or OK to run Whisper locally | elevenlabs.io → API keys; console.x.ai → API keys | they can paste keys in the app later (**⚙ Settings → Voice**), or secure request → `.env` |
 | Tailscale login (if this machine isn't on their tailnet) | you run `./run.sh ts-login`, it prints a login URL | send them the URL; wait until `ts-login` prints the relay URL |
 | Funnel allowed for this node | Tailscale admin console (link printed by `./run.sh start` if missing) | they confirm |
 | Their own package id (optional) | e.g. `com.theirname.grokbotg2` (lowercase letters, digits, dots) | `APP_PACKAGE_ID` in `.env` |
@@ -241,8 +241,8 @@ trailing slash, no path).
 
    Portal and menu names follow Even's docs at the time of writing (hub.evenrealities.com/docs → Test →
    Private Testing / Beta Testing); if they changed, follow the current docs.
-5. **First launch.** On the glasses or phone, open *Grok Bot G2*. The phone screen shows **Settings** (opened
-   automatically when not paired): **Relay URL** is prefilled with `RELAY_PUBLIC_URL`; run `./run.sh pair`, send
+5. **First launch.** On the glasses or phone, open *Grok Bot G2*. The phone screen shows the **Settings** screen
+   (opened automatically when not paired; later via the **⚙** button on the conversation list): **Relay URL** is prefilled with `RELAY_PUBLIC_URL`; run `./run.sh pair`, send
    the user the 6-digit code (valid 10 min, single use); they type it into **Pairing code** and tap **Save &
    reconnect**. Check: `logs/relay.log` shows `pair ok`, then authed requests and no `auth fail`.
 6. For every later app change: bump `version` in `app/app.json`, `./run.sh build`, re-upload, reinstall.
@@ -262,7 +262,7 @@ Providers (one setting picks; fallback tries the others that are configured, ele
   else `python3 -m venv`), installs `faster-whisper` and downloads the `base` model to `data/whisper-models`
   (~600 MB disk total). Check: it ends with `whisper ready`. Then `./run.sh reload-relay`.
 - **Keys:** either in `.env` (`ELEVENLABS_API_KEY`, `XAI_API_KEY`, then `./run.sh reload-relay`) or the user
-  pastes them in the app: phone → **Settings → Voice** (visible once paired) → password field → **Save voice
+  pastes them in the app: phone → **⚙ Settings → Voice** (visible once paired) → password field → **Save voice
   settings**. The relay checks the key with the provider first (ElevenLabs `GET /v1/user`, xAI `GET /v1/models`)
   and refuses a rejected key. Saved keys show as `Saved ✓ ···last4` with **Replace** / **Clear**; their values
   are never shown again, never logged and never sent to the glasses. They are stored in `data/secrets.json`
@@ -319,9 +319,34 @@ Known simulator limits:
 - A JavaScript `confirm()` (e.g. *Clear* key, *Delete* action) blocks the WebView and screenshots until you press
   Return: `DISPLAY=:99 XAUTHORITY=$(pgrep -a -x Xvfb | grep ' :99 ' | grep -o '/tmp/xvfb-run[^ ]*') xdotool key Return`.
 - Native `<select>` popups don't appear in webview screenshots; pick options with the arrow keys.
-- `tools/sim-pair.sh` clicks fixed coordinates of the default 600×800 phone window; if you change the
-  Settings layout before pairing, update them.
+- `tools/sim-pair.sh` clicks fixed coordinates of the default 600×800 phone window (an unpaired app opens on the
+  Settings screen: *Pairing code* at webview y≈193, *Save & reconnect* at y≈316); if you change the Settings
+  layout, update them.
 - The token is not kept across simulator restarts; run `tools/sim-pair.sh` again.
+
+### Phone UI test (WebKit + Chromium, keyboard simulated)
+
+The simulator is one fixed 600×800 Chromium window and cannot show an iPhone keyboard. For layout work on the
+phone screen use `tools/phone-test.sh` (mock stack running): it bundles `app/test/phone-harness.ts` (mounts
+`ui.ts` + `api.ts` without the Even bridge), serves it on a free loopback port and runs `app/test/phone-ui.e2e.cjs`
+in Playwright WebKit and Chromium at 390×844 and 375×667. The keyboard is simulated by halving the viewport; the
+test checks that *+ Add action* puts the new editor first with its label focused and visible, that Save, the
+message field, the voice key fields and the chat composer stay visible with the keyboard up, that Settings is its
+own screen, that there are no JS errors, and that `?debug` shows an uncaught error as an on-screen banner.
+Expect `N/N passed`; screenshots go to `test/sim/phone_*.png`.
+
+- It only runs against the mock relay (loopback URL and the bot names of `test/mock-data/bots.json`); it ignores
+  `RELAY_TOKEN`/`RELAY_PORT` from your shell on purpose. Overrides: `PHONE_TEST_RELAY`, `PHONE_TEST_TOKEN`.
+- Playwright is installed once into `run/phone-test/` (git-ignored, `PLAYWRIGHT_VERSION`, default 1.63.0).
+  On a Linux host without root that lacks WebKit's system libraries, headless WebKit (WPE) usually only misses
+  `libevent-2.1`: `apt-get download libevent-2.1-7t64 && dpkg-deb -x libevent*.deb x`, copy
+  `x/usr/lib/x86_64-linux-gnu/libevent-2.1.so.7*` into `~/.cache/ms-playwright/webkit-*/minibrowser-wpe/sys/lib/`
+  and run with `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1`; or `ENGINES=chromium tools/phone-test.sh`.
+- Real iOS differs from this simulation: the WKWebView keyboard shrinks only `visualViewport`, not the layout
+  viewport. The app handles both (`#app` is fixed to `visualViewport.height`/`offsetTop`, focused fields are
+  scrolled to the centre), but confirm layout changes on a phone.
+- On the phone, uncaught errors appear as a red banner when the app URL has `?debug` or the user ticks
+  **Settings → Show app errors on screen (debug)**.
 
 ## Day-2 operations
 
@@ -344,7 +369,7 @@ Known simulator limits:
 - Quick actions: phone → **⚡ Quick actions** to add/edit/reorder/delete (label ≤ 24, message ≤ 2000, ≤ 50
   actions); glasses → conversation list → **Quick actions** → tap one to send it. Stored in `data/actions.json`.
   Never fire a quick action yourself against real bots while testing; use the mock.
-- Voice settings: phone → **Settings → Voice**: provider, fallback switch, ElevenLabs and xAI keys
+- Voice settings: phone → **⚙** (conversation list) → **Settings → Voice**: provider, fallback switch, ElevenLabs and xAI keys
   (write-only). The Cursor key is not there by design.
 
 ## Final acceptance checklist
@@ -360,7 +385,7 @@ Run these and report each result to the user:
 | 5 | Pairing | user enters the code from `./run.sh pair` | `pair ok` in `logs/relay.log`, phone says *Paired ✓* |
 | 6 | Glasses list | user opens the app on the glasses | conversation list with avatars renders |
 | 7 | Long message | user (or simulator + mock) opens a long reply | header `p 1/N`, swipes reach the last page, nothing cut off |
-| 8 | Quick action | phone → ⚡ add one for a bot the user picks; glasses → Quick actions → tap (mock in the simulator first) | reply streams into that bot's read view (409 = bot busy, nothing sent) |
+| 8 | Quick action | phone → ⚡ → *+ Add action* (new editor opens at the top, label focused) → add one for a bot the user picks; glasses → Quick actions → tap (mock in the simulator first) | reply streams into that bot's read view (409 = bot busy, nothing sent) |
 | 9 | Voice | user: read view → tap, speak, tap | transcript is sent and the reply appears |
 
 ## Troubleshooting
@@ -373,6 +398,7 @@ Run these and report each result to the user:
 | `Could not enable Funnel` | the tailnet admin must enable HTTPS + Funnel for the node (link in the message / `logs/funnel.log`) |
 | `apt-get install tailscale` fails | use the static binaries (step 6a); no root needed |
 | App says NOT PAIRED / 401 | Pair again; the app's Relay URL must equal `RELAY_PUBLIC_URL` |
+| Phone: a field or the new quick action is hidden behind the keyboard, or a button does nothing | Ask the user to tick **⚙ Settings → Show app errors on screen (debug)** and report the red banner; reproduce with `tools/phone-test.sh` |
 | App can't reach the relay at all | Whitelist mismatch: rebuild after changing `RELAY_PUBLIC_URL`, re-upload (step 7) |
 | `409 … still working on an earlier message` | That bot is busy (or it's you, step 11); nothing was sent |
 | `bdk did not come up` | `logs/bdk.log`; usually a missing/invalid `CURSOR_API_KEY` or Node < 22.13 |

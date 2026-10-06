@@ -41,7 +41,7 @@ named tunnel) lets the phone reach that relay.
 - **Voice:** push-to-talk from the glasses mic (or the phone mic). The relay transcribes the 16 kHz PCM with
   **ElevenLabs Scribe**, **xAI Grok STT** or a local **Whisper** (faster-whisper or whisper.cpp), with an
   optional fallback to the other configured providers. Pick the provider and paste the ElevenLabs / xAI keys on
-  the phone (**Settings → Voice**). Keys are write-only and stay on the relay.
+  the phone (**⚙ Settings → Voice**). Keys are write-only and stay on the relay.
 - **Streaming per message:** a bot's ack, progress updates and final answer each arrive as soon as they are sent
   (SSE from `POST /chat/stream`). The HUD shows "… more coming" until the turn ends.
 - **Read view + full pagination:** opening a conversation shows its history first, starting at the first unread
@@ -171,7 +171,8 @@ The relay token is never bundled into the app. To connect a phone:
 ./run.sh pair      # prints a 6-digit code, valid 10 minutes, single use
 ```
 
-On the phone screen open **Settings → Pairing code**, enter the code, then tap **Save & reconnect**. The app
+Until it is paired the app opens on its **Settings** screen (later: the **⚙** button on the conversation list).
+Enter the code under **Pairing code**, then tap **Save & reconnect**. The app
 exchanges the code for the token once (`POST /pair`) and stores it in the Even app's local storage. Repeated
 wrong codes or tokens trigger rate limiting.
 
@@ -190,7 +191,7 @@ The read view never starts the microphone on its own; the footer always shows th
 
 ## Quick actions
 
-On the phone: **⚡ Quick actions** → *+ Add action* → label (≤ 24 characters, shown on the HUD), bot, message
+On the phone: **⚡ Quick actions** → *+ Add action* (the new, empty action opens at the top of the list) → label (≤ 24 characters, shown on the HUD), bot, message
 (≤ 2000 characters) → **Save**. ▲ ▼ reorder, *Delete* removes, *Send* fires it right away. Up to 50 actions.
 On the glasses: conversation list → **Quick actions** (top row) → swipe to one (`Flight status > Assistant`) →
 tap. The HUD switches to that bot's read view and streams the reply. If the bot is still busy with an earlier
@@ -213,7 +214,7 @@ synthetic, `test/stt-sample.wav`), two runs each through the relay's `/stt`. A s
 and CPU will differ. Grok STT was the fastest and ElevenLabs the most accurate, so ElevenLabs stays the default.
 Try them yourself with `tools/stt-test.sh <provider>`.</sub>
 
-- **One setting picks the provider:** `STT_PROVIDER` in `.env`, overridden by the app (**Settings → Voice**).
+- **One setting picks the provider:** `STT_PROVIDER` in `.env`, overridden by the app (**⚙ Settings → Voice**).
   With **fallback** on (`STT_FALLBACK=1`, default; also a switch in the app) a failed request is retried with the
   other *configured* providers in the order elevenlabs → grok → whisper, and the phone shows which one answered.
 - **Audio format:** the glasses send raw 16 kHz s16le mono PCM. The relay wraps it in a WAV header for every
@@ -228,7 +229,7 @@ Try them yourself with `tools/stt-test.sh <provider>`.</sub>
 
 ### In-app settings and how keys are protected
 
-The phone's **Settings → Voice** section (shown once paired) has the provider picker, the fallback switch and
+The phone's **⚙ Settings → Voice** section (shown once paired) has the provider picker, the fallback switch and
 password fields for the **ElevenLabs** and **xAI** keys, nothing else.
 
 - `GET /settings` (token required) returns the provider, fallback, order and, per key, only
@@ -314,6 +315,12 @@ tail -f logs/relay.log logs/bdk.log
   the last page).
 - Simulator (Linux, headless): `tools/sim.sh start` → `tools/sim-pair.sh` → automation API on `:9898`
   (`/api/screenshot/glasses`, `/api/input`). Convert glasses screenshots with `tools/hudview.py`.
+- Phone UI layout/keyboard test (mock stack running): `tools/phone-test.sh` builds `app/test/phone-harness.ts`
+  (the phone screen without the Even bridge) and checks it in headless **WebKit** and Chromium at 390×844 and
+  375×667, with the on-screen keyboard simulated by halving the viewport: the new quick action's editor, the
+  voice key fields and the chat composer must stay visible, with no JS errors. Screenshots go to
+  `test/sim/phone_*.png`. It refuses anything but the mock relay. Add `?debug` to the app URL (or tick
+  *Show app errors on screen* in Settings) to get uncaught errors as a red banner on the phone.
 - Typecheck: `(cd relay && npm run check)`, `(cd relay/bdk && npm run check)`, `(cd app && npm run build)`.
 
 ## For AI agents
