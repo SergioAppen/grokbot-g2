@@ -7,6 +7,7 @@
 #   ./run.sh ts-login       start our own tailscaled if configured and print the Tailscale login link / relay URL
 #   ./run.sh restart-relay  restart bdk + relay only (tunnel untouched)
 #   ./run.sh reload-relay   restart the relay only (bdk + tunnel untouched; e.g. after a git pull)
+#   ./run.sh restart-bdk    restart bdk only (after editing relay/bdk/bot/tools)
 #   ./run.sh stop           stop bdk + relay (+ cloudflared if this script started it)
 #   ./run.sh status         process status + public /health
 #   ./run.sh pair           print a one-time 6-digit pairing code (valid 10 min) for the phone app
@@ -196,17 +197,21 @@ mock() {
   python3 tools/mock-history.py "$ROOT/test/mock-data/history"
   BOTS_FILE="$ROOT/test/mock-data/bots.json" DATA_DIR="$ROOT/test/mock-data" python3 tools/avatars.py >/dev/null
   stop_one mock-relay; stop_one mock-bdk
-  MOCK_PASSIVE="${MOCK_PASSIVE:-1}" launch mock-bdk node tools/mock-bdk.mjs
+  rm -f "$ROOT/test/mock-data/sync.json" "$ROOT/test/mock-data/seen.json" # fresh mock transcripts each start
+  MOCK_PASSIVE="${MOCK_PASSIVE:-1}" MOCK_HISTORY_DIR="$ROOT/test/mock-data/history" MOCK_PROACTIVE_MS="${MOCK_PROACTIVE_MS:-0}" \
+    launch mock-bdk node tools/mock-bdk.mjs
   BOTS_FILE="$ROOT/test/mock-data/bots.json" DATA_DIR="$ROOT/test/mock-data" RELAY_PORT=8799 BDK_PORT=3199 TUNNEL_MODE=none \
     launch mock-relay node --experimental-strip-types --no-warnings relay/server.ts
   sleep 1.5; printf "mock relay http://127.0.0.1:8799 /health: "; curl -s http://127.0.0.1:8799/health; echo
   echo "Try: tools/stream-test.sh \"hello\" Assistant http://127.0.0.1:8799   (no real bot is contacted)"
+  echo "Proactive bot message: curl -s -X POST localhost:3199/mock/proactive -d '{\"agent\":\"Assistant\"}'  (or MOCK_PROACTIVE_MS=40000 ./run.sh mock)"
 }
 case "${1:-start}" in
   setup) setup;;
   start) check_node; ensure_tunnel; stop_one relay; stop_one bdk; start_bdk; start_relay; status;;
   restart-relay) check_node; stop_one relay; stop_one bdk; start_bdk; start_relay; status;;
   reload-relay) check_node; stop_one relay; start_relay; status;;
+  restart-bdk) check_node; stop_one bdk; start_bdk; status;;
   stop) stop_one relay; stop_one bdk; stop_one cloudflared; status;;
   status) status;;
   pair) pair;;
@@ -214,5 +219,5 @@ case "${1:-start}" in
   mock) shift; mock "${1:-}";;
   whisper) whisper;;
   ts-login) ts_login;;
-  *) echo "usage: $0 [setup|start|ts-login|restart-relay|reload-relay|stop|status|pair|build|mock [stop]|whisper]"; exit 1;;
+  *) echo "usage: $0 [setup|start|ts-login|restart-relay|reload-relay|restart-bdk|stop|status|pair|build|mock [stop]|whisper]"; exit 1;;
 esac

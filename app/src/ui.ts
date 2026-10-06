@@ -2,7 +2,7 @@
 import { api, avatarUrl, relTime, ACTION_LIMITS, type Action, type Msg, type Bot, type Conversation, type SttSettings, type SttUpdate } from './api'
 
 type Handlers = {
-  state: { bot: string; bots: Bot[]; phase: string; screen: string; pages: string[]; page: number; convs: Conversation[]; seen: Record<string, number>; actions: Action[] }
+  state: { bot: string; bots: Bot[]; phase: string; screen: string; pages: string[]; page: number; convs: Conversation[]; seen: Record<string, number>; actions: Action[]; working?: Record<string, boolean> }
   onSend: (text: string, bot: string) => void
   onPickBot: (bot: string) => void
   onBack: () => void
@@ -49,7 +49,7 @@ button{background:var(--s);cursor:pointer}button.primary{background:var(--a);col
 #status,#status2{font-size:13px;color:var(--d)}.error{color:#ff7b7b!important}.ok{color:#9be29b!important}
 #log{flex:1 1 auto;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px;background:var(--s);border-radius:12px;padding:10px}
 .m{max-width:85%;padding:8px 10px;border-radius:12px;white-space:pre-wrap;word-wrap:break-word}
-.m.user{align-self:flex-end;background:#2a2a2a}.m.bot{align-self:flex-start;background:#1f2a1f}.m small{display:block;color:var(--d);font-size:11px}
+.m.user{align-self:flex-end;background:#2a2a2a}.m.bot{align-self:flex-start;background:#1f2a1f}.m.attn{box-shadow:inset 3px 0 0 #ffb347}.m small{display:block;color:var(--d);font-size:11px}
 #compose{display:flex;gap:8px}#compose textarea{flex:1;resize:none;height:48px}
 .row{display:flex;gap:8px;flex-wrap:wrap}.row button{flex:1}
 #setbody{background:var(--s);border-radius:12px;padding:8px 12px}#setbody label{display:block}#setbody input{width:100%;margin:4px 0}
@@ -61,7 +61,7 @@ button{background:var(--s);cursor:pointer}button.primary{background:var(--a);col
 .c .ph{display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--d)}
 .c .mid{flex:1;min-width:0}.c .top{display:flex;gap:8px;align-items:baseline}.c .nm{flex:1;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .c .tm{font-size:12px;color:var(--d)}.c .tm.new{color:var(--a)}.c .pv{font-size:14px;color:var(--d);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.c .dot{width:10px;height:10px;border-radius:50%;background:var(--a);flex:none}
+.c .dot{width:10px;height:10px;border-radius:50%;background:var(--a);flex:none}.c .cnt{min-width:20px;height:20px;padding:0 6px;border-radius:10px;background:var(--a);color:#111;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex:none}.c .cnt.attn{background:#ffb347}.c .wk{font-size:12px;color:var(--a);font-weight:400}
 .chathead{display:flex;gap:10px;align-items:center}.chathead img{width:36px;height:36px;border-radius:50%;object-fit:cover}
 .chathead h1{font-size:18px}#back{padding:8px 12px}
 .hidden{display:none!important}
@@ -328,9 +328,12 @@ export const ui = {
     } else this.drawList(S)
   },
   drawList(S: Handlers['state']) {
+    // Unread badge: count from the relay (0.6+) or a dot; "!" when the newest message looks like it needs you.
+    const badge = (c: Conversation, u: boolean) => !u ? '' : c.attn || c.last?.attn ? `<span class="cnt attn" title="needs your attention">!${(c.unread ?? 0) > 1 ? ` ${c.unread}` : ''}</span>`
+      : (c.unread ?? 0) > 1 ? `<span class="cnt" title="new messages">${c.unread}</span>` : '<span class="dot" title="new messages"></span>'
     const list = $('list'); if (!list) return
     const unread = (c: Conversation) => !!c.last && c.last.role === 'bot' && c.last.at > (S.seen[c.name] ?? 0)
-    const sig = JSON.stringify(S.convs.map((c) => [c.name, c.last?.at, unread(c)])) + Math.floor(Date.now() / 60000)
+    const sig = JSON.stringify(S.convs.map((c) => [c.name, c.last?.at, unread(c), c.unread, c.attn || c.last?.attn, S.working?.[c.name]])) + Math.floor(Date.now() / 60000)
     if (list.dataset.sig === sig) return
     list.dataset.sig = sig
     list.innerHTML = S.convs.map((c) => {
@@ -338,8 +341,8 @@ export const ui = {
       const prev = c.last ? `${c.last.role === 'user' ? 'You: ' : ''}${c.last.text}` : 'No messages yet'
       const letter = esc((c.name.match(/[A-Za-z]/)?.[0] ?? '?').toUpperCase())
       return `<div class="c" data-name="${esc(c.name)}"><div class="ph" data-av="${esc(c.avatar)}">${letter}</div>
-        <div class="mid"><div class="top"><span class="nm">${esc(c.name)}</span><span class="tm${u ? ' new' : ''}">${c.last ? relTime(c.last.at) : ''}</span></div>
-        <div class="pv">${esc(prev)}</div></div>${u ? '<span class="dot" title="new messages"></span>' : ''}</div>`
+        <div class="mid"><div class="top"><span class="nm">${esc(c.name)}${S.working?.[c.name] ? ' <span class="wk">working…</span>' : ''}</span><span class="tm${u ? ' new' : ''}">${c.last ? relTime(c.last.at) : ''}</span></div>
+        <div class="pv">${esc(prev)}</div></div>${badge(c, u)}</div>`
     }).join('')
     // Swap monogram placeholders for the real avatars once fetched (token-auth, cached as blob URLs).
     list.querySelectorAll<HTMLElement>('.ph[data-av]').forEach((ph) => {
@@ -373,7 +376,7 @@ export const ui = {
   },
   drawLog() {
     const log = $('log'); if (!log) return
-    log.innerHTML = messages.map((m) => `<div class="m ${m.role}">${esc(m.text)}<small>${new Date(m.at).toLocaleTimeString()}</small></div>`).join('')
+    log.innerHTML = messages.map((m) => `<div class="m ${m.role}${m.attn ? ' attn' : ''}">${esc(m.text)}<small>${new Date(m.at).toLocaleTimeString()}</small></div>`).join('')
     log.scrollTop = log.scrollHeight
   },
 }

@@ -29,6 +29,10 @@ named tunnel) lets the phone reach that relay.
 |---|---|---|
 | ![HUD streaming](docs/screenshots/hud-streaming.png) | ![HUD new-message hint](docs/screenshots/hud-new-hint.png) | ![HUD busy](docs/screenshots/hud-busy.png) |
 
+| HUD: banner for a new message (needs you) | HUD: banner for a card or file | Phone: live list, unread counts, `!` = needs you |
+|---|---|---|
+| ![HUD banner](docs/screenshots/hud-banner.png) | ![HUD card banner](docs/screenshots/hud-banner-card.png) | ![Phone live unread](docs/screenshots/phone-live-unread.png) |
+
 <sub>Screenshots come from the Even Hub simulator running the bundled mock bot (`./run.sh mock`). The bot names and avatars are generated examples.</sub>
 
 ## Features
@@ -54,6 +58,11 @@ named tunnel) lets the phone reach that relay.
 - **Quick actions:** predefined messages (label, target bot, text) that you edit on the phone and fire from the
   glasses with one tap, no speaking. Stored on the relay (`data/actions.json`, `GET/PUT /actions`), cached on the
   phone. The reply streams into that bot's read view.
+- **Background sync + live updates (v0.6):** the relay reads every bot's transcript in the background (read-only),
+  so messages from the Grok Bot apps, routines and background work, and what you type in those apps, show up in
+  the list and the read view within seconds while the app is open. Unread counts per bot, a `※` marker for
+  messages that look like they need you, and a short **banner on the glasses** (`● Bot: first words…`) on any
+  screen. See *Sync and live updates*.
 - **Typed chat** with history on the phone screen, plus *Check reply*, *Interrupt* and *Re-ask* (glasses menu).
 - **Security:** bearer-token auth on every API route, one-time 6-digit **pairing codes** so the token never sits in
   the app package, per-IP and global **rate limits**, and lockout after repeated bad tokens.
@@ -63,10 +72,10 @@ named tunnel) lets the phone reach that relay.
 ```mermaid
 flowchart LR
   G[Even G2 glasses] -- BLE --> P["Even Realities phone app<br/>(WebView runs the .ehpk app)"]
-  P -- "HTTPS + Bearer token<br/>/conversations /chat/stream /stt" --> T{{"Tailscale Funnel<br/>or Cloudflare tunnel"}}
+  P -- "HTTPS + Bearer token<br/>/conversations /chat/stream /events /stt" --> T{{"Tailscale Funnel<br/>or Cloudflare tunnel"}}
   T --> R["relay/server.ts<br/>127.0.0.1:8787"]
   R -- "PCM → WAV" --> S["ElevenLabs Scribe / xAI Grok STT<br/>or local Whisper"]
-  R -- "HTTP 127.0.0.1:3100<br/>grokbot__ask / check / interrupt / list" --> B["bdk serve<br/>(@cursor/bdk Grok Bot extension)"]
+  R -- "HTTP 127.0.0.1:3100<br/>grokbot__ask / check / interrupt / list<br/>g2_peek (read-only sync)" --> B["bdk serve<br/>(@cursor/bdk Grok Bot extension)"]
   B -- "Cursor API (CURSOR_API_KEY)" --> GB[(Your Grok Bots)]
   R -. "data/history, data/avatars" .- D[(local disk)]
 ```
@@ -201,6 +210,54 @@ The list lives in `data/actions.json` on the relay (git-ignored); on first run i
 `actions.example.json`, keeping only actions whose bot exists in `bots.json`. The relay validates every save
 (array of ≤ 50, label ≤ 24, message ≤ 2000, known bot, 512 KB body cap).
 
+## Sync and live updates
+
+**What syncs.** `relay/sync.ts` polls each bot in `bots.json` through the bdk project's read-only tool
+`relay/bdk/bot/tools/g2_peek.ts` and merges new transcript entries into `data/history/<bot>.json`:
+
+- bot messages (`send-message`, also deliveries from routines and background work, which carry no special label),
+  messages you typed in the Grok Bot apps (`message`/`user`), and images/files you sent there (`user-attachment`,
+  shown as `[image or file sent from the Grok Bot app]`);
+- **cards** (question widgets with options, approval cards, secret requests) and images/files a bot sent: the
+  public entries API returns them as a `send-message` with **no text and no other fields**, so they appear as one
+  read-only line, `[card or file: open the Grok Bot app to see it]`, flagged `※`. Answer, approve or enter
+  secrets in the Grok Bot app; the relay never does (see *Known limitations*).
+
+`g2_peek` reads `GET /v0/grokbot/sessions/{id}/entries?afterUpdatedSeq=` after a cursor the relay keeps
+(`data/sync.json`). It never sends, never moves the `grokbot__check` read cursor, and never creates a bot: the
+session id comes from the bots the relay already talked to, or (once, for names in `bots.json`) from the same
+get-or-create lookup `grokbot__ask` uses, refusing a result that looks freshly created. It imports two
+`@cursor/bdk` internals by path, so `@cursor/bdk` is pinned (`0.2.18`) in `relay/bdk/package.json`.
+
+**Merge.** Dedupe by entry `seq`. Messages the relay recorded itself during a G2 turn adopt the matching seq
+(same role and text within an hour, or the parts of a joined reply), so nothing appears twice. The first sync of
+a bot is a silent backfill (up to 20 pages of 200 entries, no banner, no unread). `POST /chat` and
+`/chat/stream` also store the bot's `earlierReplies` (messages it sent before your message) instead of
+dropping them; the stream sends them as an `earlier` event.
+
+**Poll rate.** Every `SYNC_ACTIVE_MS` (15 s) while a phone/glasses client is connected to `/events`, else every
+`SYNC_IDLE_MS` (90 s). One request per bot per round (more only while paging); bots with nothing new for
+`SYNC_QUIET_H` (24) hours are polled every 4th round; a bot the relay is streaming a turn for is skipped. The
+interval stretches so the total stays under `SYNC_MAX_RPH` (3600 requests/hour). 429 and 5xx back off
+exponentially (Retry-After honoured; the API sent no rate-limit headers when we checked). `SYNC=0` turns sync
+off; `SYNC_RESOLVE=0` disables the name lookup. `GET /sync/status` shows requests in the last hour, errors,
+backoff and per-bot state.
+
+**Live updates.** `GET /events` is an SSE stream (bearer token): `hello`, `message {bot, origin, msg}`,
+`unread {bot, unread, attn}`, `bot-status {bot, busy, working}` and `reset`, a `: ping` every 25 s, resume with
+`Last-Event-ID`. The app reads it with `fetch` (so the token stays in a header), reconnects with backoff and
+falls back to reloading `/conversations` every 60 s while the stream is down; the status line shows `· live`.
+`POST /seen {bot}` stores the read position used for unread counts (sent when you read a conversation to the end).
+
+**Glasses banner.** A new bot message that you are not already reading (and that did not come from your own G2
+turn) shows for about 4 s in the HUD header on any screen: `● Research: Routine done: the weekly…`, or
+`※ Writer needs you: …` when it needs attention. Tapping the conversation list while it shows opens that bot.
+While you are recording or transcribing, the banner waits until you are done. `?banner=<ms>` in the app URL
+changes the duration (testing).
+
+**Needs attention (`※`)** is a heuristic: a card/file placeholder, or a bot message whose last line ends with a
+question mark. Approval and secret-request types would be flagged too, but the API does not expose them today.
+
 ## Speech-to-text
 
 | Provider | `stt.provider` | Key | Where audio goes | Measured on our relay* |
@@ -254,11 +311,14 @@ All routes need `Authorization: Bearer <RELAY_TOKEN>` except `GET /health`, `GET
 
 | Route | Purpose |
 |---|---|
-| `GET /conversations` | Per bot: last message, time, count, avatar URLs (newest first) |
+| `GET /conversations` | Per bot: last message (with `attn`), time, count, `unread`, `attn`, avatar URLs (newest first) |
+| `GET /events` | SSE live updates: `hello`, `message`, `unread`, `bot-status`, `reset`; heartbeat 25 s; `Last-Event-ID` resume |
+| `POST /seen {bot, at?}` | Read position for unread counts → `{bot, unread}` |
+| `GET /sync/status` | Background sync: interval, requests in the last hour, errors, backoff, per-bot state |
 | `GET /bots`, `GET /history?bot=` | Bot list; per-bot history |
 | `GET /actions` / `PUT /actions {actions:[{id?,label,bot,text}]}` | Quick actions (validated, stored in `data/actions.json`) |
-| `POST /chat/stream {bot,text}` | SSE: `status`, one `message {index,text,ms}` per bot message, `done`, `error` |
-| `POST /chat {bot,text,wait?}` / `POST /check {bot,wait?}` | Non-streaming ask / poll for more (the read view also uses `check` to pick up messages a bot sent on its own; it returns nothing while a stream for that bot is running) |
+| `POST /chat/stream {bot,text}` | SSE: `status`, `earlier {texts}` (messages the bot sent before yours), one `message {index,text,ms}` per bot message, `done`, `error` |
+| `POST /chat {bot,text,wait?}` / `POST /check {bot,wait?}` | Non-streaming ask (returns `earlier` too) / poll for more (returns nothing while a stream for that bot is running). The app no longer polls `check` for messages a bot sent on its own: background sync does that |
 | `POST /interrupt {bot}` | Interrupt the bot's current turn |
 | `POST /stt[?provider=&lang=]` | Raw 16 kHz s16le mono PCM or WAV → `{text, provider, latencyMs, fallbackFrom?}` (`provider=` forces one provider, no fallback) |
 | `GET /settings` / `PUT /settings` | STT provider, fallback and write-only ElevenLabs / xAI keys (see above); never returns key values |
@@ -267,7 +327,7 @@ All routes need `Authorization: Bearer <RELAY_TOKEN>` except `GET /health`, `GET
 ## Operations
 
 ```bash
-./run.sh status | start | stop | restart-relay | reload-relay | pair | build | ts-login | whisper
+./run.sh status | start | stop | restart-relay | reload-relay | restart-bdk | pair | build | ts-login | whisper
 tail -f logs/relay.log logs/bdk.log
 ```
 
@@ -295,8 +355,13 @@ tail -f logs/relay.log logs/bdk.log
 - **Font metrics come from the simulator:** glyph widths were measured in Even Hub simulator 0.9.5. Pages keep a
   24 px width margin and use 7 of the 8 lines that fit, in case the hardware font differs slightly.
 - **No audio output:** the G2 has no speaker, so replies are text only.
-- **History only covers this app:** previews and history come from the relay's own log, so messages you
-  exchange with a bot in the Grok Bot desktop app don't appear (except replies that arrive during a G2 turn).
+- **Cards stay in the Grok Bot app:** question widgets, approvals, secret requests and bot images/files arrive
+  from the public API as text-less entries (no prompt, options, file name or type), so the relay shows a
+  placeholder and cannot render the options. Answering a widget in the app adds no user message to the
+  transcript; it goes through a path the API does not expose, so the relay cannot answer it either. Approvals and
+  secrets deliberately stay in the official app.
+- **Live updates need the app open:** sync runs on the relay all the time, but the phone/glasses only get the
+  banner while the Even app is running the G2 app (no push notifications).
 - **Busy bots return 409:** if a bot is still working on an earlier message (from any client), nothing is sent.
   Use *Check reply* or wait.
 - **Message-level streaming only:** the Grok Bot extension exposes whole messages, not word-by-word deltas.
@@ -308,8 +373,13 @@ tail -f logs/relay.log logs/bdk.log
 
 ## Development and testing
 
-- Mock stack: `./run.sh mock` (fake `grokbot__*` tools; every message gets a 3-message reply over 12 s, a message
-  containing "long" gets one ~3000-character reply, and the first check per bot returns one "passive" message).
+- Mock stack: `./run.sh mock` (fake `grokbot__*` and `g2_peek` tools; every message gets a 3-message reply over
+  12 s, a message containing "long" gets one ~3000-character reply). "Proactive" messages as if from a routine or
+  the Grok Bot app: `curl -s -X POST localhost:3199/mock/proactive -d '{"agent":"Assistant"}'` (or `"text"`,
+  `"kind":"card"|"user"|"attachment"|"card-answered"`), or `MOCK_PROACTIVE_MS=40000 ./run.sh mock`.
+  `POST /mock/fail {"status":429,"n":2}` makes the next peeks fail.
+- Sync test (mock only): `SYNC_ACTIVE_MS=3000 SYNC_IDLE_MS=10000 ./run.sh mock && node tools/sync-test.mjs`
+  (SSE events, merge/dedupe, earlier replies, cards, resume, unread/seen, 429 backoff; expect `23/23 passed`).
 - Pagination self-test: `cd app && npx esbuild test/paginate.test.ts --bundle --platform=node --format=esm
   --loader:.txt=text --outfile=/tmp/pt.mjs && node /tmp/pt.mjs` (every page fits, no text lost, last words on
   the last page).

@@ -8,7 +8,7 @@
     "serve": "bdk serve --dir . --mode single"
   },
   "dependencies": {
-    "@cursor/bdk": "^0.2.18"
+    "@cursor/bdk": "0.2.18"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

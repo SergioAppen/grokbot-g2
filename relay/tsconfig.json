@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["server.ts", "stt.ts"]
+  "include": ["server.ts", "stt.ts", "sync.ts"]
 }

@@ -6,7 +6,10 @@
 //   POST /chat   {bot,text,wait?}     -> {status:"finished"|"running", reply, bot, latencyMs}
 //   POST /check  {bot,wait?}          -> same shape; for replies still "running"
 //   POST /interrupt {bot}             -> {ok}
-//   GET  /history?bot=NAME            -> {messages:[{role,text,at}]}
+//   GET  /history?bot=NAME            -> {messages:[{role,text,at,id,attn?}]}
+//   GET  /events                      -> text/event-stream: hello | message | unread | bot-status | reset (Last-Event-ID resume)
+//   POST /seen {bot, at?}             -> {bot, unread}   (read position for unread counts)
+//   GET  /sync/status                 -> background sync: interval, requests in the last hour, per-bot state
 //   GET  /conversations               -> {conversations:[{name,id,last:{role,text,at}|null,count,avatar,hudAvatar}]} newest first
 //   GET  /avatars/NAME.png | NAME.hud.png  (96 px colour for the phone | 40 px 4-bit grey for the HUD)
 //   POST /stt  body = raw PCM s16le 16 kHz mono (application/octet-stream) or audio/wav -> {text, provider, latencyMs, fallbackFrom?}
@@ -18,6 +21,7 @@ import { readFileSync, existsSync, writeFileSync, mkdirSync, statSync, renameSyn
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createStt, PROVIDERS, type Provider } from "./stt.ts";
+import { createSync, type Msg } from "./sync.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -56,11 +60,9 @@ const findBot = (name: string) => bots().find((b) => b.name === name) ?? bots().
 
 function log(...a: unknown[]) { console.log(new Date().toISOString(), ...a); }
 
-// ---------- history ----------
-type Msg = { role: "user" | "bot" | "system"; text: string; at: number };
-const histPath = (bot: string) => join(HISTORY_DIR, bot.replace(/[^A-Za-z0-9_-]/g, "_") + ".json");
-function history(bot: string): Msg[] { try { return JSON.parse(readFileSync(histPath(bot), "utf8")); } catch { return []; } }
-function pushHistory(bot: string, m: Msg) { const h = history(bot); h.push(m); writeFileSync(histPath(bot), JSON.stringify(h.slice(-200))); }
+// ---------- history (relay/sync.ts: storage, background sync of every bot's transcript, /events) ----------
+const history = (bot: string) => sync.history(bot);
+const pushHistory = (bot: string, m: Msg, origin?: "relay" | "earlier") => sync.pushHistory(bot, m, origin);
 
 // ---------- quick actions (predefined messages, edited on the phone, fired from the glasses) ----------
 type Action = { id: string; label: string; bot: string; text: string };
@@ -122,6 +124,11 @@ async function bdkTool(name: string, input: unknown, timeoutMs = 660_000) {
   }
   return j.result;
 }
+/** Messages the bot delivered before our message (from the app, a routine, ...): grokbot__ask returns them as
+ * earlierReplies and moves its read cursor past them, so they must be recorded here or they are lost. */
+function earlierTexts(res: any): string[] {
+  return Array.isArray(res?.earlierReplies) ? res.earlierReplies.map((x: any) => String(x?.text ?? x ?? "")).filter((t: string) => t.trim()) : [];
+}
 function replyText(res: any): string {
   if (typeof res?.reply === "string") return res.reply;
   if (Array.isArray(res?.replies)) return res.replies.map((x: any) => x?.text ?? x).join("\n\n");
@@ -136,7 +143,7 @@ stt.prewarm();
 const CORS = {
   "access-control-allow-origin": "*", // Even app WebView origin is not fixed; auth is the bearer token
   "access-control-allow-methods": "GET, POST, PUT, OPTIONS",
-  "access-control-allow-headers": "Authorization, Content-Type, X-Lang",
+  "access-control-allow-headers": "Authorization, Content-Type, X-Lang, Last-Event-ID",
   "access-control-max-age": "86400",
 };
 function send(res: http.ServerResponse, code: number, body: unknown) {
@@ -149,6 +156,8 @@ async function readBody(req: http.IncomingMessage, max = 20 * 1024 * 1024): Prom
   return Buffer.concat(chunks);
 }
 const busy = new Set<string>();
+const sync = createSync({ dataDir: DATA_DIR, historyDir: HISTORY_DIR, bots, bdkTool, log, busy });
+const setBusy = (bot: string, on: boolean) => { if (on) busy.add(bot); else busy.delete(bot); sync.setBusy(bot, on); };
 
 // ---------- rate limiting (the relay is reachable from the public internet through the tunnel) ----------
 // Fixed-window counters per client IP and bucket.
@@ -234,6 +243,15 @@ http.createServer(async (req, res) => {
     if ((url.pathname === "/chat" || url.pathname === "/chat/stream") && !hit("chat", ip)) return send(res, 429, { error: "chat rate limited" });
     if (url.pathname === "/stt" && !hit("stt", ip)) return send(res, 429, { error: "stt rate limited" });
 
+    if (req.method === "GET" && url.pathname === "/events") return sync.addClient(req, res, CORS);
+    if (req.method === "POST" && url.pathname === "/seen") {
+      const body = JSON.parse((await readBody(req, 4096)).toString() || "{}");
+      const b = findBot(String(body.bot ?? ""));
+      if (!b) return send(res, 404, { error: "unknown bot" });
+      sync.setSeen(b.name, Number(body.at) || Date.now());
+      return send(res, 200, { bot: b.name, unread: sync.unread(b.name) });
+    }
+    if (req.method === "GET" && url.pathname === "/sync/status") return send(res, 200, sync.status());
     if (req.method === "GET" && url.pathname === "/bots") {
       let contacted: any[] = [];
       try { contacted = (await bdkTool("grokbot__list", {}, 15_000)).contacted ?? []; } catch {}
@@ -248,8 +266,8 @@ http.createServer(async (req, res) => {
       const list = bots().map((b, i) => {
         const h = history(b.name), m = h[h.length - 1];
         return {
-          name: b.name, id: b.id, order: i, count: h.length,
-          last: m ? { role: m.role, text: m.text.replace(/\s+/g, " ").slice(0, 160), at: m.at } : null,
+          name: b.name, id: b.id, order: i, count: h.length, unread: sync.unread(b.name), attn: sync.unreadAttn(b.name),
+          last: m ? { role: m.role, text: m.text.replace(/\s+/g, " ").slice(0, 160), at: m.at, ...(m.attn ? { attn: true } : {}) } : null,
           // ?v=<mtime> so a regenerated avatar is not served from the WebView's HTTP cache
           avatar: `/avatars/${encodeURIComponent(b.name)}.png?v=${avatarVer(b.name, "")}`,
           hudAvatar: `/avatars/${encodeURIComponent(b.name)}.hud.png?v=${avatarVer(b.name, ".hud")}`,
@@ -320,12 +338,12 @@ http.createServer(async (req, res) => {
       const text = String(body.text ?? "").trim();
       if (!text) return send(res, 400, { error: "text required" });
       if (busy.has(b.name)) return send(res, 409, { error: "bot busy with a previous message; poll /check" });
-      busy.add(b.name);
+      setBusy(b.name, true);
       const t0 = Date.now();
       // Send first (wait 0 = send + one look) so "bot busy"/errors come back as a normal HTTP status.
       let r: any;
       try { r = await bdkTool("grokbot__ask", { agent: b.name, message: text, wait_seconds: 0 }, 60_000); }
-      catch (e: any) { busy.delete(b.name); return send(res, e?.status === 409 ? 409 : 502, { error: String(e?.message ?? e) }); }
+      catch (e: any) { setBusy(b.name, false); return send(res, e?.status === 409 ? 409 : 502, { error: String(e?.message ?? e) }); }
       res.writeHead(200, { ...CORS, "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store", "x-accel-buffering": "no", connection: "keep-alive" });
       res.flushHeaders?.();
       const ev = (event: string, data: unknown) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
@@ -339,6 +357,9 @@ http.createServer(async (req, res) => {
         log("stream msg", b.name, n, Date.now() - t0, "ms");
       };
       try {
+        const earlier = earlierTexts(r);
+        for (const t of earlier) pushHistory(b.name, { role: "bot", text: t, at: t0 - 1 }, "earlier");
+        if (earlier.length) ev("earlier", { texts: earlier });
         pushHistory(b.name, { role: "user", text, at: Date.now() });
         ev("status", { phase: "sent", ms: 0 });
         emit(replyText(r));
@@ -358,7 +379,7 @@ http.createServer(async (req, res) => {
       } catch (e: any) {
         ev("error", { error: String(e?.message ?? e), status: e?.status });
       } finally {
-        clearInterval(hb); busy.delete(b.name); res.end();
+        clearInterval(hb); setBusy(b.name, false); res.end();
       }
       return;
     }
@@ -375,15 +396,17 @@ http.createServer(async (req, res) => {
         const text = String(body.text ?? "").trim();
         if (!text) return send(res, 400, { error: "text required" });
         if (busy.has(b.name)) return send(res, 409, { error: "bot busy with a previous message; poll /check" });
-        busy.add(b.name);
+        setBusy(b.name, true);
         try {
           pushHistory(b.name, { role: "user", text, at: Date.now() });
           const r = await bdkTool("grokbot__ask", { agent: b.name, message: text, wait_seconds: wait });
+          const earlier = earlierTexts(r);
+          for (const t of earlier) pushHistory(b.name, { role: "bot", text: t, at: t0 - 1 }, "earlier");
           const reply = replyText(r);
           if (reply) pushHistory(b.name, { role: "bot", text: reply, at: Date.now() });
           log("chat", b.name, r.status, Date.now() - t0, "ms");
-          return send(res, 200, { bot: b.name, status: r.status, reply, latencyMs: Date.now() - t0 });
-        } finally { busy.delete(b.name); }
+          return send(res, 200, { bot: b.name, status: r.status, reply, latencyMs: Date.now() - t0, ...(earlier.length ? { earlier } : {}) });
+        } finally { setBusy(b.name, false); }
       }
       if (busy.has(b.name)) return send(res, 200, { bot: b.name, status: "running", reply: "", latencyMs: 0, note: "turn in progress (streaming)" });
       const r = await bdkTool("grokbot__check", { agent: b.name, wait_seconds: Math.min(wait, 60) });
@@ -396,4 +419,4 @@ http.createServer(async (req, res) => {
     log("error", url.pathname, e?.message);
     return send(res, e?.status && e.status >= 400 && e.status < 600 ? e.status : 500, { error: String(e?.message ?? e) });
   }
-}).listen(PORT, "127.0.0.1", () => log(`relay listening on 127.0.0.1:${PORT} (stt=${stt.provider()}, tunnel=${TUNNEL_MODE})`));
+}).listen(PORT, "127.0.0.1", () => { log(`relay listening on 127.0.0.1:${PORT} (stt=${stt.provider()}, tunnel=${TUNNEL_MODE})`); sync.start(); });

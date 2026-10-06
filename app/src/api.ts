@@ -1,11 +1,11 @@
 // Relay client. Relay = relay/server.ts behind your HTTPS tunnel (Tailscale Funnel or a Cloudflare named tunnel).
 export type Bot = { name: string; id?: string; contacted?: boolean; lastContactAt?: string }
-export type Msg = { role: 'user' | 'bot' | 'system'; text: string; at: number }
+export type Msg = { role: 'user' | 'bot' | 'system'; text: string; at: number; id?: string; attn?: boolean }
 export type ChatResult = { bot: string; status: 'finished' | 'running'; reply: string; latencyMs?: number }
 
 export type Conversation = {
-  name: string; id?: string; count: number
-  last: { role: Msg['role']; text: string; at: number } | null
+  name: string; id?: string; count: number; unread?: number; attn?: boolean
+  last: { role: Msg['role']; text: string; at: number; attn?: boolean } | null
   avatar: string; hudAvatar: string
 }
 
@@ -55,6 +55,8 @@ export const api = {
   // wait 85s keeps us under Cloudflare's ~100 s proxy timeout; longer turns come back "running"
   chat: (bot: string, text: string) =>
     call<ChatResult>('/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot, text, wait: 85 }) }),
+  seen: (bot: string, at = Date.now()) =>
+    call<{ bot: string; unread: number }>('/seen', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot, at }) }, 15_000),
   check: (bot: string, wait = 25) =>
     call<ChatResult>('/check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot, wait }) }, 60_000),
   interrupt: (bot: string) =>
@@ -74,6 +76,7 @@ export type StreamEvent =
   | { type: 'message'; index: number; text: string; ms: number }
   | { type: 'done'; status: 'finished' | 'running'; messages: number; ms: number }
   | { type: 'error'; error: string; status?: number }
+  | { type: 'earlier'; texts: string[] }
 
 /** POST /chat/stream and parse the SSE body incrementally (EventSource cannot POST or send headers). */
 export async function chatStream(bot: string, text: string, onEvent: (e: StreamEvent) => void): Promise<void> {
@@ -87,7 +90,12 @@ export async function chatStream(bot: string, text: string, onEvent: (e: StreamE
     const j: any = await r.json().catch(() => ({}))
     throw Object.assign(new Error(j.error ?? `HTTP ${r.status}`), { status: r.status })
   }
-  const reader = r.body.getReader()
+  await readSse(r.body, (event, data) => onEvent({ type: event, ...data } as StreamEvent))
+}
+
+/** Parse a text/event-stream body: one callback per frame with a JSON data line (comments = heartbeats). */
+async function readSse(body: ReadableStream<Uint8Array>, onFrame: (event: string, data: any, id: string) => void): Promise<void> {
+  const reader = body.getReader()
   const dec = new TextDecoder()
   let buf = ''
   for (;;) {
@@ -97,17 +105,55 @@ export async function chatStream(bot: string, text: string, onEvent: (e: StreamE
     let i: number
     while ((i = buf.indexOf('\n\n')) >= 0) {
       const block = buf.slice(0, i); buf = buf.slice(i + 2)
-      let event = 'message', data = ''
+      let event = 'message', data = '', id = ''
       for (const line of block.split('\n')) {
         if (line.startsWith('event:')) event = line.slice(6).trim()
         else if (line.startsWith('data:')) data += line.slice(5).trim()
+        else if (line.startsWith('id:')) id = line.slice(3).trim()
       }
       if (!data) continue // heartbeat comment
       let parsed: any
       try { parsed = JSON.parse(data) } catch { continue } // ignore a malformed frame
-      onEvent({ type: event, ...parsed } as StreamEvent)
+      onFrame(event, parsed, id)
     }
   }
+}
+
+// ── Live updates: GET /events (the relay's background sync of every bot + relay turns), read with fetch so the
+// bearer token can be sent. Reconnects with backoff and resumes with Last-Event-ID.
+export type RelayEvent =
+  | { type: 'hello'; boot: string; now: number; intervalMs: number; bots: Record<string, { busy: boolean; working: boolean }> }
+  | { type: 'message'; bot: string; origin: 'sync' | 'relay' | 'earlier'; msg: Msg }
+  | { type: 'unread'; bot: string; unread: number; attn?: boolean }
+  | { type: 'bot-status'; bot: string; busy: boolean; working: boolean; source: string }
+  | { type: 'reset'; reason: string }
+export function connectEvents(onEvent: (e: RelayEvent) => void, onState: (connected: boolean) => void): () => void {
+  let stop = false, lastId = '', delay = 1000, ctl: AbortController | null = null
+  ;(async () => {
+    while (!stop) {
+      ctl = new AbortController()
+      try {
+        if (!cfg.relayUrl || !cfg.token) throw new Error('not paired')
+        const r = await fetch(cfg.relayUrl.replace(/\/$/, '') + '/events', {
+          headers: { authorization: `Bearer ${cfg.token}`, accept: 'text/event-stream', ...(lastId ? { 'last-event-id': lastId } : {}) },
+          signal: ctl.signal,
+        })
+        if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`)
+        onState(true); delay = 1000
+        // A silent connection (no heartbeat for 60 s) is treated as dead.
+        let alive = Date.now()
+        const watchdog = setInterval(() => { if (Date.now() - alive > 60_000) ctl?.abort() }, 10_000)
+        try {
+          await readSse(r.body, (event, data, id) => { alive = Date.now(); if (id) lastId = id; onEvent({ type: event, ...data } as RelayEvent) })
+        } finally { clearInterval(watchdog) }
+      } catch { /* offline, relay restarting, aborted */ }
+      onState(false)
+      if (stop) break
+      await new Promise((res) => setTimeout(res, delay + Math.random() * 500))
+      delay = Math.min(30_000, delay * 2)
+    }
+  })()
+  return () => { stop = true; ctl?.abort() }
 }
 
 /** Ask, then keep polling /check while the bot is still working (up to ~10 min). */

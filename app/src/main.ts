@@ -11,7 +11,7 @@ import {
   AudioInputSource,
   type EvenAppBridge,
 } from '@evenrealities/even_hub_sdk'
-import { api, askAndWait, avatarData, chatStream, cfg, relTime, type Action, type Bot, type Conversation, type Msg } from './api'
+import { api, askAndWait, avatarData, chatStream, cfg, connectEvents, relTime, type Action, type Bot, type Conversation, type Msg, type RelayEvent } from './api'
 import { paginate, sanitize, textWidth, charWidth } from './paginate'
 import { ui } from './ui'
 
@@ -19,7 +19,7 @@ import { ui } from './ui'
 type Screen = 'bots' | 'chat' | 'actions'
 type Phase = 'idle' | 'listening' | 'transcribing' | 'sending' | 'thinking' | 'streaming' | 'reply' | 'error'
 /** One message in the HUD read view, pre-split into pages (see paginate.ts). */
-type Item = { role: Msg['role']; text: string; at: number; pages: string[] }
+type Item = { role: Msg['role']; text: string; at: number; pages: string[]; id?: string; attn?: boolean }
 const S = {
   screen: 'bots' as Screen,
   screenAt: 0,                   // when the screen last changed (ignores the tap that opened it)
@@ -40,6 +40,8 @@ const S = {
   page: 0,
   lastPrompt: '',
   micSource: AudioInputSource.Glasses as AudioInputSource,
+  working: {} as Record<string, boolean>, // bot busy with a turn (relay stream or elsewhere, from /events)
+  live: false,                   // /events connected
 }
 let pcmChunks: Uint8Array[] = []
 let pcmBytes = 0
@@ -67,7 +69,11 @@ S.bot = (await store.get('bot')) || '' // empty until /conversations returns the
 try { S.seen = JSON.parse((await store.get('seen')) || '{}') } catch { S.seen = {} }
 try { S.actions = JSON.parse((await store.get('actions')) || '[]') } catch { S.actions = [] }
 export const isUnread = (c: Conversation) => !!c.last && c.last.role === 'bot' && c.last.at > (S.seen[c.name] ?? 0)
-async function markSeen(name: string) { S.seen[name] = Date.now(); await store.set('seen', JSON.stringify(S.seen)) }
+async function markSeen(name: string) {
+  S.seen[name] = Date.now(); await store.set('seen', JSON.stringify(S.seen))
+  const c = S.convs.find((x) => x.name === name); if (c) { c.unread = 0; c.attn = false }
+  if (cfg.token) api.seen(name).catch(() => { /* offline: the relay's unread count catches up next time */ })
+}
 S.micSource = (await store.get('mic')) === 'phone' ? AudioInputSource.Phone : AudioInputSource.Glasses
 
 // ───────────────────────── glasses rendering ─────────────────────────
@@ -94,7 +100,34 @@ function fit(line: string, width = TEXT_W - 8): string {
 type Row = { kind: 'actions' } | { kind: 'conv'; c: Conversation }
 const listRows = (): Row[] => [{ kind: 'actions' }, ...S.convs.map((c) => ({ kind: 'conv' as const, c }))]
 
+// ── Banner: a new bot message from elsewhere (routine, other device, Grok Bot app) shows for BANNER_MS in the
+// header line on any screen. Never while recording/transcribing (it waits, up to 60 s). ※ = looks like it needs you.
+const BANNER_MS = Number(new URLSearchParams(location.search).get('banner')) || 4000
+let banner: { bot: string; text: string; until: number } | null = null
+let pendingBanner: { bot: string; text: string; at: number } | null = null
+const bannerOn = () => !!banner && Date.now() < banner.until
+function bannerText(bot: string, m: Msg): string {
+  const prev = sanitize(m.text).replace(/\s+/g, ' ').trim()
+  // Relay placeholders ("[card or file: open the Grok Bot app to see it]", "[needs your approval in the Grok Bot app]")
+  if (/^\[.*\]$/.test(prev)) return fit(`${m.attn ? '※' : '●'} ${bot}: ${prev.slice(1, -1)}`)
+  return fit(m.attn ? `※ ${bot} needs you: ${prev}` : `● ${bot}: ${prev}`)
+}
+function showBanner(bot: string, text: string) {
+  if (S.phase === 'listening' || S.phase === 'transcribing') { pendingBanner = { bot, text, at: Date.now() }; return }
+  banner = { bot, text, until: Date.now() + BANNER_MS }
+  redrawHeader()
+  window.setTimeout(() => { if (banner && Date.now() >= banner.until) { banner = null; redrawHeader() } }, BANNER_MS + 50)
+}
+window.setInterval(() => {
+  if (pendingBanner && S.phase !== 'listening' && S.phase !== 'transcribing') {
+    const p = pendingBanner; pendingBanner = null
+    if (Date.now() - p.at < 60_000) showBanner(p.bot, p.text)
+  }
+}, 1000)
+function redrawHeader() { if (S.screen === 'bots') refreshList(); else refresh() }
+
 function header(): string {
+  if (bannerOn()) return banner!.text
   if (S.screen === 'bots') {
     if (!cfg.token) return 'NOT PAIRED · phone screen → Settings → code'
     const n = listRows().length, w = winStart()
@@ -163,7 +196,9 @@ function rowContent(r: Row | undefined, selected: boolean): string {
   const c = r.c
   const when = c.last ? `  · ${relTime(c.last.at)}` : ''
   const prev = c.last ? `${c.last.role === 'user' ? 'You: ' : ''}${sanitize(c.last.text).replace(/\s+/g, ' ')}` : 'No messages yet'
-  return `${fit(`${mark}${c.name}${isUnread(c) ? '  ●' : ''}${when}`, 500)}\n${fit(`   ${prev}`, 500)}`
+  const dot = isUnread(c) ? (c.attn || c.last?.attn ? '  ※' : '  ●') + ((c.unread ?? 0) > 1 ? ` ${c.unread}` : '') : ''
+  const busy = S.working[c.name] ? '  …' : ''
+  return `${fit(`${mark}${c.name}${dot}${busy}${when}`, 500)}\n${fit(`   ${prev}`, 500)}`
 }
 function botsPage() {
   const w = winStart(), rows = listRows()
@@ -309,13 +344,13 @@ function refresh() {
 function syncPreview() { S.pages = [S.screen === 'bots' ? '' : `${header()}\n${S.screen === 'actions' ? actionsBody() : body()}\n${footer()}`]; S.page = 0 }
 
 // ── read-view model
-function toItem(m: Pick<Msg, 'role' | 'text' | 'at'>): Item {
-  const prefix = m.role === 'user' ? '» You: ' : m.role === 'system' ? '! ' : ''
-  return { role: m.role, text: m.text, at: m.at, pages: paginate(prefix + m.text) }
+function toItem(m: Pick<Msg, 'role' | 'text' | 'at' | 'id' | 'attn'>): Item {
+  const prefix = m.role === 'user' ? '» You: ' : m.role === 'system' ? '! ' : m.attn ? '※ ' : ''
+  return { role: m.role, text: m.text, at: m.at, id: m.id, attn: m.attn, pages: paginate(prefix + m.text) }
 }
 const atEnd = () => !S.items.length || (S.mi === S.items.length - 1 && S.pi >= S.items[S.mi].pages.length - 1)
 /** Append a message. Follows it only if the reader was already at the end; otherwise shows the "↓ n new" hint. */
-function addItem(m: Pick<Msg, 'role' | 'text' | 'at'>, follow = atEnd() && !S.overlay) {
+function addItem(m: Pick<Msg, 'role' | 'text' | 'at' | 'id' | 'attn'>, follow = atEnd() && !S.overlay) {
   S.items.push(toItem(m))
   if (follow || S.overlay) { S.mi = S.items.length - 1; S.pi = 0; S.overlay = '' }
   else if (S.unseenFrom === null) S.unseenFrom = S.items.length - 1
@@ -375,18 +410,7 @@ async function openBot(name: string, opts: { quiet?: boolean } = {}) {
   if (firstUnread >= 0 && firstUnread < S.items.length - 1 && !pending.length) S.unseenFrom = firstUnread + 1
   if (atEnd()) markSeen(name)
   refresh()
-  if (!opts.quiet) pullPassive(name)
-}
-/** Messages the bot sent on its own while we were away: ask the relay once (it records them in history). */
-async function pullPassive(name: string) {
-  if (inflight || S.bot !== name || S.screen !== 'chat') return
-  try {
-    const r = await api.check(name, 0)
-    if (r.reply && S.bot === name && S.screen === 'chat' && !inflight) {
-      addItem({ role: 'bot', text: r.reply, at: Date.now() })
-      ui.addMessage({ role: 'bot', text: r.reply, at: Date.now() })
-    }
-  } catch { /* busy or offline: the next open/poll will catch up */ }
+  // Messages the bot sends on its own (routines, other devices) arrive through /events (relay background sync).
 }
 async function openBotList() {
   if (S.phase === 'listening') await stopMic(false)
@@ -451,7 +475,8 @@ export async function sendPrompt(text: string, bot = S.bot) {
     try {
       await chatStream(bot, text, (e) => {
         streamed = true
-        if (e.type === 'status') setPhase('thinking')
+        if (e.type === 'earlier') insertEarlier(bot, e.texts)
+        else if (e.type === 'status') setPhase('thinking')
         else if (e.type === 'message') {
           got++
           S.phase = 'streaming'
@@ -546,6 +571,7 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
   if (S.screen === 'bots') {
     if (t === OsEventTypeList.SCROLL_TOP_EVENT) return moveSel(-1)
     if (t === OsEventTypeList.SCROLL_BOTTOM_EVENT) return moveSel(1)
+    if (t === OsEventTypeList.CLICK_EVENT && !fresh && bannerOn()) { const b = banner!.bot; banner = null; openBot(b); return }
     if (t === OsEventTypeList.CLICK_EVENT && !fresh) {
       const r = listRows()[S.sel]
       if (r?.kind === 'actions') openActions()
@@ -593,6 +619,7 @@ ui.mount({
     await store.set('relayUrl', cfg.relayUrl); await store.set('relayToken', cfg.token)
     await loadBots()
     await loadActions()
+    startEvents()
   },
   onSaveActions: async (list) => {
     const r = await api.saveActions(list)
@@ -627,7 +654,7 @@ async function loadConvs() {
     if (!S.bots.find((b) => b.name === S.bot)) S.bot = r.default
     const i = S.convs.findIndex((c) => c.name === selName)
     S.sel = selRow?.kind === 'actions' ? 0 : i >= 0 ? i + 1 : Math.min(S.sel, S.convs.length)
-    ui.setStatus('ok', `Relay connected · ${S.bots.length} bots`)
+    ui.setStatus('ok', `Relay connected · ${S.bots.length} bots${S.live ? ' · live' : ''}`)
   } catch (e) {
     ui.setStatus('error', `Relay: ${(e as Error).message}`)
   }
@@ -635,13 +662,75 @@ async function loadConvs() {
   else ui.render(S)
 }
 const loadBots = loadConvs
-// Keep previews / unread dots fresh while the list is showing; in the read view, pick up messages
-// the bot sent on its own (relay /check, never while a turn of ours is in flight).
+// ───────────────────────── live updates (/events) ─────────────────────────
+/** Messages the bot delivered before ours (stream "earlier" / origin "earlier"): insert them before our message. */
+function insertEarlier(bot: string, texts: string[]) {
+  if (S.screen !== 'chat' || S.bot !== bot) return
+  let at = S.items.length
+  for (let i = S.items.length - 1; i >= 0; i--) if (S.items[i].role === 'user') { at = i; break }
+  const fresh = texts.filter((t) => !S.items.some((it) => it.role === 'bot' && it.text === t))
+  if (!fresh.length) return
+  S.items.splice(at, 0, ...fresh.map((t) => toItem({ role: 'bot', text: t, at: Date.now() - 1 })))
+  if (S.mi >= at) S.mi += fresh.length
+  for (const t of fresh) ui.addMessage({ role: 'bot', text: t, at: Date.now() - 1 })
+  refresh()
+}
+let convTimer: number | null = null
+const loadConvsSoon = () => { if (convTimer === null) convTimer = window.setTimeout(() => { convTimer = null; loadConvs() }, 400) }
+function onRelayEvent(e: RelayEvent) {
+  if (DEBUG) console.log('[event]', JSON.stringify(e).slice(0, 200))
+  if (e.type === 'hello') { S.working = Object.fromEntries(Object.entries(e.bots).map(([k, v]) => [k, v.busy || v.working])); loadConvsSoon(); return }
+  if (e.type === 'reset') { loadConvsSoon(); if (S.screen === 'chat' && !inflight) reloadOpen(); return }
+  if (e.type === 'unread') { const c = S.convs.find((x) => x.name === e.bot); if (c) { c.unread = e.unread; c.attn = !!e.attn; if (S.screen === 'bots') refreshList() } return }
+  if (e.type === 'bot-status') { S.working[e.bot] = e.busy || e.working; if (S.screen === 'bots') refreshList(); return }
+  if (e.type !== 'message') return
+  const { bot, msg, origin } = e
+  // Conversation list: newest message + order (instant), then the relay's view (debounced).
+  const c = S.convs.find((x) => x.name === bot)
+  if (c && (!c.last || msg.at >= c.last.at)) { c.last = { role: msg.role, text: msg.text.replace(/\s+/g, ' ').slice(0, 160), at: msg.at, attn: msg.attn }; c.count++ }
+  if (c && msg.role === 'bot' && msg.attn) c.attn = true
+  loadConvsSoon()
+  const reading = S.screen === 'chat' && S.bot === bot
+  if (reading) {
+    if (origin === 'earlier') insertEarlier(bot, [msg.text])
+    else if (origin === 'relay' && inflight) { /* our own turn: the stream already shows it */ }
+    else if (!S.items.some((it) => (msg.id && it.id === msg.id) || (it.role === msg.role && it.text === msg.text))) {
+      addItem(msg)
+      ui.addMessage(msg)
+      if (atEnd()) markSeen(bot)
+    }
+  } else if (S.screen === 'bots') refreshList()
+  if (msg.role === 'bot' && origin !== 'relay' && !reading) {
+    const text = bannerText(bot, msg)
+    showBanner(bot, text)
+    ui.toast(`${msg.attn ? '※ ' : ''}${bot}: ${sanitize(msg.text).replace(/\s+/g, ' ').slice(0, 80)}`)
+  }
+}
+/** After a reset (relay restart, backfill): re-read the open conversation and append what is missing. */
+async function reloadOpen() {
+  const name = S.bot
+  try {
+    const msgs = (await api.history(name)).messages
+    if (S.bot !== name || S.screen !== 'chat') return
+    for (const m of msgs.slice(-40)) if (!S.items.some((it) => (m.id && it.id === m.id) || (it.role === m.role && it.text === m.text))) addItem(m, false)
+  } catch { /* offline */ }
+}
+let stopEvents: (() => void) | null = null
+function startEvents() {
+  stopEvents?.()
+  if (!cfg.token) return
+  stopEvents = connectEvents(onRelayEvent, (on) => {
+    if (on === S.live) return
+    S.live = on
+    if (on) ui.setStatus('ok', `Relay connected · ${S.bots.length} bots · live`)
+  })
+}
+// Fallback while /events is down: refresh the list every 60 s.
 window.setInterval(() => {
-  if (!cfg.token || document.hidden) return
-  if (S.screen === 'bots') loadConvs()
-  else if (S.screen === 'chat' && !inflight && (S.phase === 'idle' || S.phase === 'reply' || S.phase === 'error')) pullPassive(S.bot)
-}, 30_000)
+  if (!cfg.token || document.hidden || S.live) return
+  loadConvs()
+}, 60_000)
 await rebuild()
 await loadConvs()
 await loadActions()
+startEvents()

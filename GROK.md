@@ -131,6 +131,8 @@ curl -s -H "authorization: Bearer $RELAY_TOKEN" http://127.0.0.1:8799/settings |
 
 - Check: `message` events at about 4, 8 and 12 s, then `done` and `HTTP 200`.
 - Check: `/settings` shows `provider`, `order` and per key only `set` / `source` / `last4`.
+- Sync (mock only): `./run.sh mock stop; SYNC_ACTIVE_MS=3000 SYNC_IDLE_MS=10000 ./run.sh mock && node tools/sync-test.mjs`
+  → `23/23 passed` (proactive messages arrive over `/events`, no duplicates, cards as placeholders, backoff).
 
 ### 6. Tailscale Funnel (stable public HTTPS URL)
 
@@ -283,6 +285,11 @@ Providers (one setting picks; fallback tries the others that are configured, ele
   sent. Test against a different bot the user names, or use the mock.
 - One clearly labelled message: `tools/stream-test.sh "TEST from G2 relay setup, please reply OK" <ExactBotName>`.
   A `409` means that bot is busy; don't retry in a loop.
+- Background sync is read-only and starts with the relay. After `./run.sh start`, check
+  `curl -s -H "authorization: Bearer $RELAY_TOKEN" http://127.0.0.1:$RELAY_PORT/sync/status`: every bot should
+  get `backfilled: true` within a few minutes, `errors` should stay 0, and `requestsLastHour` should settle
+  around (bots × 3600 / interval). `logs/relay.log` shows `sync backfill <bot> <n>` once per bot and
+  `sync new <bot> <n>` afterwards. A `created` note means a name in `bots.json` is wrong: fix it, don't retry.
 
 ## Testing in the simulator (Linux, headless)
 
@@ -351,7 +358,10 @@ Expect `N/N passed`; screenshots go to `test/sim/phone_*.png`.
 ## Day-2 operations
 
 - After a relay code or `bots.json` change: `./run.sh reload-relay` (relay only) or `./run.sh restart-relay`
-  (relay + bdk). The URL stays the same, no re-pairing.
+  (relay + bdk); after editing `relay/bdk/bot/tools/*` (e.g. `g2_peek.ts`): `./run.sh restart-bdk`. The URL
+  stays the same, no re-pairing. Check first that no turn is streaming (`tail logs/relay.log`).
+- Sync health: `GET /sync/status` (token). `relay/bdk/package.json` pins `@cursor/bdk` because `g2_peek.ts`
+  imports two of its internals by path; after an upgrade, typecheck `relay/bdk` and run `tools/sync-test.mjs`.
 - App changes: bump `version` in `app/app.json`, `./run.sh build`, ask the user to re-upload and reinstall.
 - New phone or lost token: `./run.sh pair`. To revoke all phones, put a new random `RELAY_TOKEN` in `.env`,
   `./run.sh restart-relay`, then re-pair.
@@ -365,7 +375,10 @@ Expect `N/N passed`; screenshots go to `test/sim/phone_*.png`.
 - Glasses: tap a conversation to **read** it (history first, starting at the first unread message). Swipe ▲▼ to
   page through messages; **tap** to talk (tap again to send), **double-tap** to go back (or cancel while
   listening), **hold** for push-to-talk. The footer always shows the gestures. `↓ n new` means messages arrived
-  below where you are reading.
+  below where you are reading. Messages from the Grok Bot apps and routines appear within seconds while the app
+  is open (`· live` in the phone status line), with a short banner on the glasses; `※` means a message looks
+  like it needs them (a question, or a card/file they have to open in the Grok Bot app: options, approvals and
+  secrets can only be handled there).
 - Quick actions: phone → **⚡ Quick actions** to add/edit/reorder/delete (label ≤ 24, message ≤ 2000, ≤ 50
   actions); glasses → conversation list → **Quick actions** → tap one to send it. Stored in `data/actions.json`.
   Never fire a quick action yourself against real bots while testing; use the mock.
@@ -387,6 +400,7 @@ Run these and report each result to the user:
 | 7 | Long message | user (or simulator + mock) opens a long reply | header `p 1/N`, swipes reach the last page, nothing cut off |
 | 8 | Quick action | phone → ⚡ → *+ Add action* (new editor opens at the top, label focused) → add one for a bot the user picks; glasses → Quick actions → tap (mock in the simulator first) | reply streams into that bot's read view (409 = bot busy, nothing sent) |
 | 9 | Voice | user: read view → tap, speak, tap | transcript is sent and the reply appears |
+| 10 | Sync | `tools/sync-test.mjs` on the mock (step 5), then `GET /sync/status` on the real relay | `23/23 passed`; every bot backfilled, `errors` 0, sane `requestsLastHour` |
 
 ## Troubleshooting
 
