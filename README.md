@@ -233,7 +233,9 @@ get-or-create lookup `grokbot__ask` uses, refusing a result that looks freshly c
 
 **Merge.** Dedupe by entry `seq`. Messages the relay recorded itself during a G2 turn adopt the matching seq
 (same role and text within an hour, or the parts of a joined reply), so nothing appears twice. The first sync of
-a bot is a silent backfill (up to 20 pages of 200 entries, no banner, no unread). `POST /chat` and
+a bot is a silent backfill (20 pages of 200 entries per poll, continued over several polls for long transcripts;
+no banner, no unread). Afterwards, only messages from the last 6 hours raise events; an older backlog is merged
+quietly. `POST /chat` and
 `/chat/stream` also store the bot's `earlierReplies` (messages it sent before your message) instead of
 dropping them; the stream sends them as an `earlier` event.
 

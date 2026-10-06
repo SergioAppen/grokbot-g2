@@ -42,6 +42,7 @@ const MAX_RPH = num(process.env.SYNC_MAX_RPH, 3600);
 const QUIET_MS = num(process.env.SYNC_QUIET_H, 24) * 3600_000;
 const ENABLED = process.env.SYNC !== "0";
 const RESOLVE = process.env.SYNC_RESOLVE !== "0";
+const FRESH_MS = 6 * 3600_000; // incremental messages older than this are merged without events
 // The public entries API returns only {seq, updatedSeq, kind, role?, text?, createdAtMs}: question widgets, approval
 // and secret-request cards, images and files all arrive as a `send-message` with no text (checked on real
 // transcripts, v0.6.0). So they show as one read-only placeholder, flagged "needs you"; answering stays in the app.
@@ -212,15 +213,18 @@ export function createSync(o: Opts) {
     const newest = (r.entries ?? []).reduce((a: number, e: Entry) => Math.max(a, e.createdAtMs || 0), 0);
     if (newest) st.lastActivity = Math.max(st.lastActivity ?? 0, newest);
     if (!st.backfilled) {
-      st.backfilled = true;
+      if (!r.more) st.backfilled = true; // a long transcript backfills over several silent polls
       if (seen[bot] === undefined) { seen[bot] = Date.now(); save(seenPath, seen); } // backfill never counts as unread
-      o.log("sync backfill", bot, `${(r.entries ?? []).length} entries, ${added.length} added`);
+      o.log("sync backfill", bot, `${(r.entries ?? []).length} entries, ${added.length} added${r.more ? ", more" : ""}`);
       if (added.length) emit("reset", { reason: "backfill", bot });
     } else if (added.length && !silent) {
-      stats.newMessages += added.length;
-      for (const m of added) emit("message", { bot, origin: "sync", msg: wire(m) });
+      // Only recent messages are "new" (events, banner); anything older (late backlog) is merged quietly.
+      const fresh = added.filter((m) => m.at > Date.now() - FRESH_MS);
+      stats.newMessages += fresh.length;
+      for (const m of fresh) emit("message", { bot, origin: "sync", msg: wire(m) });
+      if (fresh.length < added.length) emit("reset", { reason: "backlog", bot });
       emitUnread(bot);
-      o.log("sync new", bot, added.length);
+      o.log("sync new", bot, fresh.length, fresh.length < added.length ? `(+${added.length - fresh.length} older)` : "");
     }
     if (r.more) st.nextPoll = 0; // backlog left: continue next tick
     saveState();
