@@ -18,6 +18,7 @@ let H: Handlers
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!)
 let messages: Msg[] = []
+let logBot = ''               // bot whose history is in the phone chat log
 let draft: Action[] = []      // quick-actions editor working copy
 let dirty = false
 type PhoneView = 'main' | 'actions' | 'settings'
@@ -49,7 +50,7 @@ button{background:var(--s);cursor:pointer}button.primary{background:var(--a);col
 #status,#status2{font-size:13px;color:var(--d)}.error{color:#ff7b7b!important}.ok{color:#9be29b!important}
 #log{flex:1 1 auto;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px;background:var(--s);border-radius:12px;padding:10px}
 .m{max-width:85%;padding:8px 10px;border-radius:12px;white-space:pre-wrap;word-wrap:break-word}
-.m.user{align-self:flex-end;background:#2a2a2a}.m.bot{align-self:flex-start;background:#1f2a1f}.m.attn{box-shadow:inset 3px 0 0 #ffb347}.m small{display:block;color:var(--d);font-size:11px}
+.m.user{align-self:flex-end;background:#2a2a2a}.m.bot{align-self:flex-start;background:#1f2a1f}.m.attn{box-shadow:inset 3px 0 0 #ffb347}.m .open{display:block;margin-top:6px;color:#ffb347;font-weight:600;text-decoration:none}.m small{display:block;color:var(--d);font-size:11px}
 #compose{display:flex;gap:8px}#compose textarea{flex:1;resize:none;height:48px}
 .row{display:flex;gap:8px;flex-wrap:wrap}.row button{flex:1}
 #setbody{background:var(--s);border-radius:12px;padding:8px 12px}#setbody label{display:block}#setbody input{width:100%;margin:4px 0}
@@ -371,12 +372,17 @@ export const ui = {
   },
   addMessage(m: Msg) { messages.push(m); this.drawLog() },
   async loadHistory(bot: string) {
+    logBot = bot
     try { messages = (await api.history(bot)).messages } catch { messages = [] }
     this.drawLog()
   },
   drawLog() {
     const log = $('log'); if (!log) return
-    log.innerHTML = messages.map((m) => `<div class="m ${m.role}${m.attn ? ' attn' : ''}">${esc(m.text)}<small>${new Date(m.at).toLocaleTimeString()}</small></div>`).join('')
+    // Cards / approvals / secret requests / bot files only exist in the Grok Bot app: offer its agent deep link
+    // (grokbot://app/v1/agent?id=<agent id from bots.json>; community-documented scheme, may not open from every WebView).
+    const id = H.state.convs.find((c) => c.name === logBot)?.id ?? H.state.bots.find((b) => b.name === logBot)?.id
+    const open = id && /^[A-Za-z0-9_-]{1,80}$/.test(id) ? `<a class="open" href="grokbot://app/v1/agent?id=${id}">Open in Grok Bot ↗</a>` : ''
+    log.innerHTML = messages.map((m) => `<div class="m ${m.role}${m.attn ? ' attn' : ''}">${esc(m.text)}${m.role === 'bot' && open && /^\[(card or file|needs )/.test(m.text) ? open : ''}<small>${new Date(m.at).toLocaleTimeString()}</small></div>`).join('')
     log.scrollTop = log.scrollHeight
   },
 }

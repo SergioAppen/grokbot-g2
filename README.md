@@ -221,7 +221,9 @@ The list lives in `data/actions.json` on the relay (git-ignored); on first run i
 - **cards** (question widgets with options, approval cards, secret requests) and images/files a bot sent: the
   public entries API returns them as a `send-message` with **no text and no other fields**, so they appear as one
   read-only line, `[card or file: open the Grok Bot app to see it]`, flagged `※`. Answer, approve or enter
-  secrets in the Grok Bot app; the relay never does (see *Known limitations*).
+  secrets in the Grok Bot app; the relay never does (see *Known limitations*). On the phone the placeholder has an
+  **Open in Grok Bot ↗** link, `grokbot://app/v1/agent?id=<id>` with the bot's `id` from `bots.json` (shown only
+  when an id is set; the scheme is community-documented, not in Cursor's docs, and may not open from every WebView).
 
 `g2_peek` reads `GET /v0/grokbot/sessions/{id}/entries?afterUpdatedSeq=` after a cursor the relay keeps
 (`data/sync.json`). It never sends, never moves the `grokbot__check` read cursor, and never creates a bot: the
@@ -358,8 +360,11 @@ tail -f logs/relay.log logs/bdk.log
 - **Cards stay in the Grok Bot app:** question widgets, approvals, secret requests and bot images/files arrive
   from the public API as text-less entries (no prompt, options, file name or type), so the relay shows a
   placeholder and cannot render the options. Answering a widget in the app adds no user message to the
-  transcript; it goes through a path the API does not expose, so the relay cannot answer it either. Approvals and
-  secrets deliberately stay in the official app.
+  transcript; it goes through a path the API does not expose, so the relay cannot answer it either. Approvals
+  (Allow once / Always allow / Deny) and secure secret requests are documented only as controls in the Grok Bot
+  desktop and iPhone apps; there is no public API for them, so they stay there. Supporting them here would need
+  Cursor to expose card payloads (type, prompt, options, approval target) in the entries API plus a documented,
+  separately scoped endpoint to answer, approve or deny.
 - **Live updates need the app open:** sync runs on the relay all the time, but the phone/glasses only get the
   banner while the Even app is running the G2 app (no push notifications).
 - **Busy bots return 409:** if a bot is still working on an earlier message (from any client), nothing is sent.
