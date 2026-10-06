@@ -30,7 +30,7 @@ export type SttOptions = { dataDir: string; root: string; log: (...a: unknown[])
 export function createStt(o: SttOptions) {
   const SECRETS = process.env.SECRETS_FILE ?? join(o.dataDir, "secrets.json");
   const ENV_PROVIDER = (process.env.STT_PROVIDER ?? "elevenlabs").toLowerCase();
-  const ELEVEN_MODEL = process.env.STT_MODEL ?? "scribe_v1";
+  const ELEVEN_MODEL = process.env.STT_MODEL ?? "scribe_v2";
   const XAI_URL = process.env.XAI_STT_URL ?? "https://api.x.ai/v1/stt";
   const WHISPER_BACKEND = (process.env.WHISPER_BACKEND ?? "faster-whisper").toLowerCase(); // faster-whisper | cpp
   const FW_PYTHON = process.env.WHISPER_PYTHON ?? join(o.root, ".whisper-venv", "bin", "python");

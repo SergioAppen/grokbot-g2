@@ -204,7 +204,7 @@ The list lives in `data/actions.json` on the relay (git-ignored); on first run i
 
 | Provider | `stt.provider` | Key | Where audio goes | Measured on our relay* |
 |---|---|---|---|---|
-| ElevenLabs Scribe (`scribe_v1`) | `elevenlabs` (default) | `ELEVENLABS_API_KEY` or app | ElevenLabs | 0.5–1.1 s; 3/3 clips word-perfect |
+| ElevenLabs Scribe (`scribe_v2`) | `elevenlabs` (default) | `ELEVENLABS_API_KEY` or app | ElevenLabs | tested with scribe_v1: 0.5–1.1 s, 3/3 clips word-perfect |
 | xAI Grok STT (`POST https://api.x.ai/v1/stt`) | `grok` | `XAI_API_KEY` or app | xAI | 0.2–0.5 s; 1/3 word-perfect ("G2" → "G two" twice, "glasses" → "classes", "of" → "on") |
 | Local Whisper (faster-whisper `base`, CPU float32) | `whisper` | none | stays on the relay | 6–29 s on a busy 8-core box; 2/3 word-perfect ("three" → "free") |
 
