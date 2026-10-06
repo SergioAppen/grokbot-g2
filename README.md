@@ -13,6 +13,10 @@ named tunnel) lets the phone reach that relay.
 |---|---|---|
 | ![Phone conversation list](docs/screenshots/phone-conversations.png) | ![Phone quick actions editor](docs/screenshots/phone-quick-actions.png) | ![Phone chat](docs/screenshots/phone-chat.png) |
 
+| Phone: voice settings (provider + write-only keys) | Phone: a rejected key is never saved | |
+|---|---|---|
+| ![Phone voice settings](docs/screenshots/phone-settings-voice.png) | ![Phone voice settings, invalid key](docs/screenshots/phone-settings-invalid-key.png) | |
+
 | HUD: conversations (+ Quick actions) | HUD: quick actions | HUD: read view |
 |---|---|---|
 | ![HUD conversation list](docs/screenshots/hud-conversations.png) | ![HUD quick actions list](docs/screenshots/hud-quick-actions.png) | ![HUD read view](docs/screenshots/hud-read-view.png) |
@@ -35,7 +39,9 @@ named tunnel) lets the phone reach that relay.
 - **Avatars:** your own pictures (`avatars-src/<Bot>.png`) or a generated coloured shape with the bot's initial.
   The phone gets a 96 px colour version and the HUD a 40 px 4-bit greyscale dithered version.
 - **Voice:** push-to-talk from the glasses mic (or the phone mic). The relay transcribes the 16 kHz PCM with
-  **ElevenLabs Scribe** or a local **whisper.cpp**.
+  **ElevenLabs Scribe**, **xAI Grok STT** or a local **Whisper** (faster-whisper or whisper.cpp), with an
+  optional fallback to the other configured providers. Pick the provider and paste the ElevenLabs / xAI keys on
+  the phone (**Settings → Voice**). Keys are write-only and stay on the relay.
 - **Streaming per message:** a bot's ack, progress updates and final answer each arrive as soon as they are sent
   (SSE from `POST /chat/stream`). The HUD shows "… more coming" until the turn ends.
 - **Read view + full pagination:** opening a conversation shows its history first, starting at the first unread
@@ -59,7 +65,7 @@ flowchart LR
   G[Even G2 glasses] -- BLE --> P["Even Realities phone app<br/>(WebView runs the .ehpk app)"]
   P -- "HTTPS + Bearer token<br/>/conversations /chat/stream /stt" --> T{{"Tailscale Funnel<br/>or Cloudflare tunnel"}}
   T --> R["relay/server.ts<br/>127.0.0.1:8787"]
-  R -- "PCM → WAV" --> S["ElevenLabs Scribe<br/>or whisper.cpp"]
+  R -- "PCM → WAV" --> S["ElevenLabs Scribe / xAI Grok STT<br/>or local Whisper"]
   R -- "HTTP 127.0.0.1:3100<br/>grokbot__ask / check / interrupt / list" --> B["bdk serve<br/>(@cursor/bdk Grok Bot extension)"]
   B -- "Cursor API (CURSOR_API_KEY)" --> GB[(Your Grok Bots)]
   R -. "data/history, data/avatars" .- D[(local disk)]
@@ -80,9 +86,11 @@ flowchart LR
 - A **Cursor account with Grok Bots** and a **Cursor API key** for that account.
 - An always-on computer for the relay (Linux or macOS) with **Node.js 22.13+**, `python3` with Pillow
   (`pip install pillow`) for avatars, `curl`.
-- **Speech-to-text**, either:
-  - an **ElevenLabs API key** (Scribe), or
-  - **whisper.cpp** built locally plus a ggml model (`ggml-base.bin` is a good start; ~150 MB RAM).
+- **Speech-to-text**, one or more of:
+  - an **ElevenLabs API key** (Scribe),
+  - an **xAI API key** (Grok STT, https://console.x.ai),
+  - **local Whisper**: `./run.sh whisper` installs faster-whisper (prebuilt wheels, no compiler) and the `base`
+    model (~600 MB disk, ~500 MB RAM while loaded). whisper.cpp also works.
 - A **stable public HTTPS URL** for the relay, either:
   - **Tailscale Funnel** (free; you get `https://<machine>.<tailnet>.ts.net`), or
   - a **Cloudflare named tunnel** on a domain you control. Quick tunnels (`trycloudflare.com`) change URL every
@@ -100,13 +108,21 @@ cp .env.example .env && chmod 600 .env
    Bot; the backend addresses bots by name and **creates a new empty bot for an unknown name**. Optional per bot:
    `avatarShape` (`blob|tablet|cloud|pebble|wedge|teardrop|hex|squircle`) and `avatarColor`
    (`red|orange|yellow|green|cyan|blue|violet|magenta|brown`). To use real pictures, drop `avatars-src/<Name>.png`.
-2. **`.env`:** set `CURSOR_API_KEY`, `RELAY_PUBLIC_URL`, `TUNNEL_MODE`, and the STT settings (`STT_PROVIDER`
-   plus `ELEVENLABS_API_KEY`, or `WHISPER_BIN` + `WHISPER_MODEL`). Every option is documented in `.env.example`.
+   If your Grok Bots live in per-agent folders (`<agents>/<id>/profile.json` + `avatar.*`),
+   `python3 tools/bots-from-agents.py <agents> --only "Exact Name" …` drafts `bots.json` with names copied
+   verbatim; set `AGENTS_DIR=<agents>` so `tools/avatars.py` uses their pictures.
+2. **`.env`:** set `CURSOR_API_KEY`, `RELAY_PUBLIC_URL` and `TUNNEL_MODE`. Optionally preset STT
+   (`STT_PROVIDER`, `ELEVENLABS_API_KEY`, `XAI_API_KEY`); you can also do that later from the phone. Every option
+   is documented in `.env.example`. **`CURSOR_API_KEY` is only ever set here**: the app has no field for it and
+   no relay endpoint reads or writes it.
 3. **Tunnel**
    - *Tailscale Funnel:* install Tailscale, run `tailscale up` (it prints a login link), and allow Funnel for the
      node in your tailnet policy. `RELAY_PUBLIC_URL=https://<machine>.<tailnet>.ts.net`. `./run.sh start` runs
-     `tailscale funnel --bg $RELAY_PORT`. Containers without a system tailscaled can set `TAILSCALED_BIN` and
-     `TAILSCALE_STATE_DIR` (and optionally `TAILSCALED_FLAGS=--tun=userspace-networking`).
+     `tailscale funnel --bg $RELAY_PORT`. **No root / no apt?** Unpack the static binaries from
+     https://pkgs.tailscale.com/stable/ into `./tailscale/`, set `TAILSCALED_BIN`, `TAILSCALE_BIN`,
+     `TAILSCALE_STATE_DIR=$PWD/tailscale/state` and `TAILSCALED_FLAGS=--tun=userspace-networking`, then
+     `./run.sh ts-login` starts a userspace tailscaled and prints the login link and, once logged in, your URL.
+     GROK.md has the full walkthrough.
    - *Cloudflare:* create a named tunnel whose public hostname points to `http://127.0.0.1:8787`, then set
      `CLOUDFLARE_TUNNEL_TOKEN` (dashboard tunnel) or `CLOUDFLARE_TUNNEL=<name>` (locally managed).
      `./run.sh start` runs `cloudflared` and tracks its PID.
@@ -129,11 +145,15 @@ cp .env.example .env && chmod 600 .env
 
 **Private / beta build (recommended; keeps working while the phone is locked)**
 
-1. Sign in at https://hub.evenrealities.com and create an app for your package id if asked.
-2. *Private build:* upload `app/grokbot-g2.ehpk` under **Private builds**. On the phone: Even Realities app →
-   Even Hub → **Me → Apps → Private builds** → Install.
-3. *Beta build (more robust when locked):* create a beta group (e.g. just your own email), upload the `.ehpk`
-   under **Builds** and push it to the group. On the phone: **Me → Beta tester** → Install.
+1. Sign in at https://hub.evenrealities.com/login with the same account as the phone app, then force-quit and
+   reopen the Even Realities app (that enables Developer Mode). Create a project for your package id
+   (`APP_PACKAGE_ID`: globally unique, lowercase letters/digits and dots only, permanent once released).
+2. *Private build (quick smoke test):* upload `app/grokbot-g2.ehpk` under **Private builds**. On the phone:
+   Even Realities app → Even Hub → **Me → Apps → Private builds** → Install. Even's docs say private builds
+   survive backgrounding only briefly.
+3. *Beta build (recommended for daily use; survives a locked phone):* **Beta groups** → create e.g. `self-test`
+   with your own email, **Builds** → upload the `.ehpk` → push it to the group. On the phone: **Me → Beta
+   tester** → Install.
 4. For every app change, bump `version` in `app/app.json`, run `./run.sh build`, then re-upload and reinstall.
    Relay-only changes just need `./run.sh restart-relay`.
 
@@ -180,6 +200,53 @@ The list lives in `data/actions.json` on the relay (git-ignored); on first run i
 `actions.example.json`, keeping only actions whose bot exists in `bots.json`. The relay validates every save
 (array of ≤ 50, label ≤ 24, message ≤ 2000, known bot, 512 KB body cap).
 
+## Speech-to-text
+
+| Provider | `stt.provider` | Key | Where audio goes | Measured on our relay* |
+|---|---|---|---|---|
+| ElevenLabs Scribe (`scribe_v1`) | `elevenlabs` (default) | `ELEVENLABS_API_KEY` or app | ElevenLabs | 0.5–1.1 s; 3/3 clips word-perfect |
+| xAI Grok STT (`POST https://api.x.ai/v1/stt`) | `grok` | `XAI_API_KEY` or app | xAI | 0.2–0.5 s; 1/3 word-perfect ("G2" → "G two" twice, "glasses" → "classes", "of" → "on") |
+| Local Whisper (faster-whisper `base`, CPU float32) | `whisper` | none | stays on the relay | 6–29 s on a busy 8-core box; 2/3 word-perfect ("three" → "free") |
+
+<sub>*Three short English clips in the G2 format (16 kHz s16le mono: two recorded in the simulator, one
+synthetic, `test/stt-sample.wav`), two runs each through the relay's `/stt`. A small sample; your voice, accent
+and CPU will differ. Grok STT was the fastest and ElevenLabs the most accurate, so ElevenLabs stays the default.
+Try them yourself with `tools/stt-test.sh <provider>`.</sub>
+
+- **One setting picks the provider:** `STT_PROVIDER` in `.env`, overridden by the app (**Settings → Voice**).
+  With **fallback** on (`STT_FALLBACK=1`, default; also a switch in the app) a failed request is retried with the
+  other *configured* providers in the order elevenlabs → grok → whisper, and the phone shows which one answered.
+- **Audio format:** the glasses send raw 16 kHz s16le mono PCM. The relay wraps it in a WAV header for every
+  provider (ElevenLabs and xAI auto-detect WAV; Whisper reads it directly). WAV uploads pass through unchanged.
+- **Grok STT** uses xAI's documented REST endpoint: multipart `file` (sent last, as the API requires),
+  optional `language` + `format=true`, `Authorization: Bearer <XAI_API_KEY>`. `XAI_STT_URL` overrides the URL.
+- **Whisper:** `./run.sh whisper` creates `./.whisper-venv` (with `uv` if present, else `python3 -m venv`),
+  installs `faster-whisper` and downloads `WHISPER_MODEL_NAME` (default `base`) to `data/whisper-models`. The
+  relay starts one long-lived worker (`tools/whisper-worker.py`) on first use, or at startup when Whisper is the
+  chosen provider, and passes it no secrets. `WHISPER_COMPUTE=float32` is the default because `int8` returned
+  empty text on our test CPU. For whisper.cpp set `WHISPER_BACKEND=cpp`, `WHISPER_BIN` and `WHISPER_MODEL`.
+
+### In-app settings and how keys are protected
+
+The phone's **Settings → Voice** section (shown once paired) has the provider picker, the fallback switch and
+password fields for the **ElevenLabs** and **xAI** keys, nothing else.
+
+- `GET /settings` (token required) returns the provider, fallback, order and, per key, only
+  `{set, source: "app" | "env", last4}`. **Key values are never returned**, logged or sent to the glasses.
+- `PUT /settings {provider?, fallback?, keys?: {elevenlabs?, xai?}, clear?: ["elevenlabs"|"xai"]}` is
+  write-only: an empty or missing key means *unchanged*; **Clear** removes a key saved from the app (a key from
+  `.env` stays until you edit `.env`). Unknown fields (a Cursor key, for example) are rejected.
+- Before saving, the relay checks a new key with a cheap call (ElevenLabs `GET /v1/user`, xAI `GET /v1/models`).
+  A rejected key is not saved and the phone shows *key rejected ✗*; if the check can't decide (network, scoped
+  key) the key is saved and shown as *could not verify*. `STT_VALIDATE=0` turns the check off (offline/test).
+- Keys must be 16–256 characters of `A–Z a–z 0–9 _ . -`; the body is capped at 16 KB; `PUT` is limited to
+  10 per 10 minutes per IP. Every change writes an audit line such as `settings <ip> provider=grok xai=set(valid)`,
+  and rejected attempts write `settings rejected <ip> <reason>`, never values.
+- App-set keys are stored in `data/secrets.json` (`SECRETS_FILE`), written atomically with mode `600`, and take
+  precedence over `.env`. They live only on the relay; the phone forgets the field as soon as it is saved.
+- **The Cursor API key is relay-only.** It lives in `.env` (`CURSOR_API_KEY`, set when you install, see Setup)
+  and is passed to `bdk serve`; it is not part of `/settings` or any other endpoint.
+
 ## Relay API (summary)
 
 All routes need `Authorization: Bearer <RELAY_TOKEN>` except `GET /health`, `GET /app/*` and `POST /pair`.
@@ -192,13 +259,14 @@ All routes need `Authorization: Bearer <RELAY_TOKEN>` except `GET /health`, `GET
 | `POST /chat/stream {bot,text}` | SSE: `status`, one `message {index,text,ms}` per bot message, `done`, `error` |
 | `POST /chat {bot,text,wait?}` / `POST /check {bot,wait?}` | Non-streaming ask / poll for more (the read view also uses `check` to pick up messages a bot sent on its own; it returns nothing while a stream for that bot is running) |
 | `POST /interrupt {bot}` | Interrupt the bot's current turn |
-| `POST /stt` | Raw 16 kHz s16le mono PCM or WAV → `{text}` |
+| `POST /stt[?provider=&lang=]` | Raw 16 kHz s16le mono PCM or WAV → `{text, provider, latencyMs, fallbackFrom?}` (`provider=` forces one provider, no fallback) |
+| `GET /settings` / `PUT /settings` | STT provider, fallback and write-only ElevenLabs / xAI keys (see above); never returns key values |
 | `GET /avatars/<name>.png`, `/avatars/<name>.hud.png` | Phone / HUD avatars |
 
 ## Operations
 
 ```bash
-./run.sh status | start | stop | restart-relay | pair | build
+./run.sh status | start | stop | restart-relay | reload-relay | pair | build | ts-login | whisper
 tail -f logs/relay.log logs/bdk.log
 ```
 
@@ -213,10 +281,13 @@ tail -f logs/relay.log logs/bdk.log
   Funnel, `Cf-Connecting-Ip` for Cloudflare).
 - The relay and `bdk serve` bind to `127.0.0.1` only. `bdk serve` takes its bearer token on the command line,
   so other local users can see it in `ps`. Run the relay on a machine you trust.
-- Keep `.env`, `bots.json`, `data/` (history, avatars, pairing file) and `qr/` private. They are git-ignored.
+- Keep `.env`, `bots.json`, `data/` (history, avatars, pairing file, `secrets.json`) and `qr/` private. They are git-ignored.
 - Anyone holding the relay token can talk to every bot listed in `bots.json`. To revoke access, rotate
   `RELAY_TOKEN` in `.env`, run `./run.sh restart-relay` and re-pair your phone.
-- Audio goes to ElevenLabs only when `STT_PROVIDER=elevenlabs`; with whisper.cpp it never leaves your machine.
+- Audio goes to ElevenLabs or xAI only when that provider is chosen or used as a fallback; with Whisper it never
+  leaves your machine. Turn fallback off if audio must never reach a provider you didn't pick.
+- STT keys set from the app are write-only (see *In-app settings*); `data/secrets.json` is mode 600 and
+  git-ignored. The Cursor API key can only be changed in `.env` on the relay.
 
 ## Known limitations
 

@@ -1,5 +1,5 @@
 // Phone-side companion UI (rendered in the Even app WebView).
-import { api, avatarUrl, relTime, ACTION_LIMITS, type Action, type Msg, type Bot, type Conversation } from './api'
+import { api, avatarUrl, relTime, ACTION_LIMITS, type Action, type Msg, type Bot, type Conversation, type SttSettings, type SttUpdate } from './api'
 
 type Handlers = {
   state: { bot: string; bots: Bot[]; phase: string; screen: string; pages: string[]; page: number; convs: Conversation[]; seen: Record<string, number>; actions: Action[] }
@@ -21,6 +21,14 @@ let messages: Msg[] = []
 let draft: Action[] = []      // quick-actions editor working copy
 let dirty = false
 let phoneActions = false       // phone is showing the Quick actions editor
+let stt: SttSettings | null = null                          // last /settings snapshot (never contains key values)
+const replacing: Record<string, boolean> = {}               // key rows where the user tapped "Replace"
+const KEYS = [
+  { k: 'elevenlabs', p: 'elevenlabs', label: 'ElevenLabs API key' },
+  { k: 'xai', p: 'grok', label: 'xAI API key (Grok STT)' },
+] as const
+const PROVIDER_LABEL = { elevenlabs: 'ElevenLabs Scribe', grok: 'Grok STT (xAI)', whisper: 'Whisper (local, on the relay)' } as const
+const CHECK_LABEL = { valid: 'key valid ✓', invalid: 'key rejected ✗', unknown: 'could not verify' } as const
 
 const CSS = `
 :root{color-scheme:dark;--t:#fff;--d:#8a8a8a;--bg:#111;--s:#1a1a1a;--in:rgba(255,255,255,.08);--a:#FEF991}
@@ -36,7 +44,7 @@ button{background:var(--s);cursor:pointer}button.primary{background:var(--a);col
 #compose{display:flex;gap:8px}#compose textarea{flex:1;resize:none;height:48px}
 .row{display:flex;gap:8px;flex-wrap:wrap}.row button{flex:1}
 details{background:var(--s);border-radius:12px;padding:8px 12px}details input{width:100%;margin:4px 0}
-#list{flex:1;overflow-y:auto;background:var(--s);border-radius:12px}
+#list{flex:1;min-height:0;overflow-y:auto;background:var(--s);border-radius:12px}
 .c{display:flex;gap:12px;align-items:center;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);cursor:pointer}
 .c:active{background:rgba(255,255,255,.05)}.c img,.c .ph{width:48px;height:48px;border-radius:50%;flex:none;background:#2a2a2a;object-fit:cover}
 .c .ph{display:flex;align-items:center;justify-content:center;font-weight:700;color:var(--d)}
@@ -50,6 +58,12 @@ details{background:var(--s);border-radius:12px;padding:8px 12px}details input{wi
 .qa .r{display:flex;gap:6px}.qa .r input{flex:1;min-width:0}.qa .r select{flex:1;min-width:0}.qa textarea{width:100%;resize:vertical;min-height:56px}
 .qa .r button{padding:8px 10px}#qalist{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px}
 .qa small{color:var(--d);font-size:12px}#qahint{font-size:13px;color:var(--d)}
+#settings[open]{overflow-y:auto;min-height:0;flex:0 1 auto}
+.stt{display:flex;flex-direction:column;gap:8px;margin-top:12px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08)}
+.stt h2{font-size:15px;margin:0}.stt select{width:100%;margin-top:4px}.stt .chk{display:flex;gap:8px;align-items:center;font-size:14px}
+.stt .chk input{width:auto;margin:0}.stt .key{background:var(--in);border-radius:10px;padding:8px 10px;display:flex;flex-direction:column;gap:6px}
+.stt .key .r{display:flex;gap:6px;align-items:center}.stt .key .st{flex:1;font-size:13px;color:var(--d)}.stt .key .st.ok{color:#9be29b}
+.stt .key button{padding:6px 10px;font-size:14px}.stt .key input{margin:0}.stt small{font-size:12px;color:var(--d)}#sttstatus{font-size:13px;color:var(--d)}
 #hud{font-family:ui-monospace,monospace;font-size:12px;color:#3CFA44;background:#000;border-radius:8px;padding:6px 8px;white-space:pre-wrap;max-height:90px;overflow:hidden}
 `
 
@@ -85,6 +99,15 @@ export const ui = {
         <label>Pairing code<input id="pair" inputmode="numeric" placeholder="6-digit code from ./run.sh pair"></label>
         <label>…or relay token<input id="token" type="password" placeholder="(stored on this phone)"></label>
         <button id="save">Save &amp; reconnect</button>
+        <div class="stt hidden" id="stt">
+          <h2>Voice · speech-to-text</h2>
+          <label>Provider<select id="sttprov"></select></label>
+          <label class="chk"><input type="checkbox" id="sttfb"> If it fails, try the other configured providers</label>
+          <div id="sttkeys"></div>
+          <button class="primary" id="sttsave">Save voice settings</button>
+          <div id="sttstatus"></div>
+          <small>Keys are write-only: they are stored on your relay (file mode 600), never shown again and never sent to the glasses. The Cursor API key is not set here; it stays in the relay's .env.</small>
+        </div>
       </details>`
     $('back').onclick = () => h.onBack()
     $('qaopen').onclick = () => { phoneActions = true; dirty = false; draft = h.state.actions.map((a) => ({ ...a })); this.render(h.state); this.drawActions() }
@@ -130,9 +153,66 @@ export const ui = {
     $('talk').onclick = () => h.onTalk()
     $('check').onclick = () => h.onCheck()
     $('stop').onclick = () => h.onInterrupt()
+    $('settings').addEventListener('toggle', () => { if (($('settings') as HTMLDetailsElement).open) this.loadStt() })
+    $('sttkeys').onclick = async (e) => {
+      const b = (e.target as HTMLElement).closest('button'); const k = b?.dataset.k as 'elevenlabs' | 'xai' | undefined; if (!b || !k) return
+      if (b.dataset.op === 'replace') { replacing[k] = !replacing[k]; this.drawStt(); if (replacing[k]) ($(`key-${k}`) as HTMLInputElement | null)?.focus(); return }
+      if (b.dataset.op === 'clear') {
+        if (!confirm(`Remove the ${KEYS.find((x) => x.k === k)!.label} saved from the app?`)) return
+        await this.saveStt({ clear: [k] }, 'Cleared ✓')
+      }
+    }
+    $('sttsave').onclick = () => {
+      const u: SttUpdate = { provider: $<HTMLSelectElement>('sttprov').value as SttUpdate['provider'], fallback: $<HTMLInputElement>('sttfb').checked, keys: {} }
+      for (const { k } of KEYS) { const v = ($(`key-${k}`) as HTMLInputElement | null)?.value.trim(); if (v) u.keys![k] = v }
+      void this.saveStt(u, 'Saved ✓')
+    }
     $('save').onclick = () => h.onSaveSettings($<HTMLInputElement>('relay').value, $<HTMLInputElement>('token').value, $<HTMLInputElement>('pair').value)
   },
   showActions() { $('qaopen')?.click() },
+  sttStatus(kind: 'ok' | 'error' | 'info', text: string) { const s = $('sttstatus'); if (s) { s.className = kind; s.textContent = text } },
+  async loadStt() {
+    $('stt').classList.toggle('hidden', !H.cfg.token) // shown once paired (keeps the pairing form compact)
+    if (!H.cfg.token) { stt = null; this.drawStt(); return }
+    this.sttStatus('info', 'Loading…')
+    try { stt = await api.settings(); this.drawStt(); this.sttStatus('info', '') }
+    catch (e) { this.sttStatus('error', `Could not load voice settings: ${(e as Error).message}`) }
+  },
+  async saveStt(u: SttUpdate, okText: string) {
+    for (const { k } of KEYS) { if (u.keys?.[k] && !/^[A-Za-z0-9_.\-]{16,256}$/.test(u.keys[k]!)) return this.sttStatus('error', `${KEYS.find((x) => x.k === k)!.label}: that does not look like an API key`) }
+    this.sttStatus('info', u.keys && Object.keys(u.keys).length ? 'Checking the key with the provider…' : 'Saving…')
+    try {
+      stt = await api.saveSettings(u)
+      for (const { k } of KEYS) replacing[k] = false
+      this.drawStt()
+      const checks = Object.entries(stt.checks ?? {}).map(([k, v]) => `${k === 'xai' ? 'xAI' : 'ElevenLabs'}: ${CHECK_LABEL[v as keyof typeof CHECK_LABEL]}`)
+      this.sttStatus('ok', [okText, ...checks].join(' · '))
+    } catch (e) {
+      const c = (e as { body?: SttSettings }).body?.checks
+      this.drawStt(c)
+      this.sttStatus('error', (e as Error).message)
+    }
+  },
+  /** Render the provider picker and the key rows. Inputs are always empty: saved keys are never sent back. */
+  drawStt(failed?: SttSettings['checks']) {
+    const sel = $<HTMLSelectElement>('sttprov'), box = $('sttkeys'); if (!sel || !box) return
+    if (!stt) { sel.innerHTML = ''; box.innerHTML = ''; return }
+    const st = stt
+    sel.innerHTML = (Object.keys(PROVIDER_LABEL) as (keyof typeof PROVIDER_LABEL)[]).map((p) =>
+      `<option value="${p}"${p === st.provider ? ' selected' : ''}>${PROVIDER_LABEL[p]}${st.providers[p].configured ? '' : ' (not set up)'}</option>`).join('')
+    $<HTMLInputElement>('sttfb').checked = st.fallback
+    box.innerHTML = KEYS.map(({ k, p, label }) => {
+      const ks = st.providers[p].key
+      const shown = !ks.set || replacing[k]
+      const state = ks.set ? `Saved ✓ ···${esc(ks.last4 ?? '')} · ${ks.source === 'app' ? 'set in the app' : "from the relay's .env"}` : 'Not set'
+      const chk = failed?.[k] ? ` · ${CHECK_LABEL[failed[k]!]}` : ''
+      return `<div class="key"><div class="r"><b style="flex:none;font-size:14px">${label}</b></div>
+        <div class="r"><span class="st${ks.set ? ' ok' : ''}">${state}${chk}</span>
+          ${ks.set ? `<button data-k="${k}" data-op="replace">${replacing[k] ? 'Cancel' : 'Replace'}</button>` : ''}
+          ${ks.source === 'app' ? `<button data-k="${k}" data-op="clear">Clear</button>` : ''}</div>
+        ${shown ? `<input id="key-${k}" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="256" placeholder="${ks.set ? 'Paste the new key' : 'Paste key'}">` : ''}</div>`
+    }).join('') + `<small>Order now: ${st.order.map((p) => PROVIDER_LABEL[p].split(' (')[0]).join(' → ')}${st.providers.whisper.configured ? '' : ' · Whisper is not installed on the relay (see README)'}</small>`
+  },
   setStatus(kind: 'ok' | 'error' | 'info', text: string) { for (const id of ['status', 'status2']) { const s = $(id); if (s) { s.className = kind; s.textContent = text } } },
   toast(text: string) { this.setStatus('info', text) },
   settingsSaved() { $<HTMLInputElement>('pair').value = ''; $<HTMLInputElement>('token').value = ''; ($('settings') as HTMLDetailsElement).open = false },

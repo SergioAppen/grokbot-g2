@@ -12,6 +12,20 @@ export type Conversation = {
 export type Action = { id: string; label: string; bot: string; text: string }
 export const ACTION_LIMITS = { max: 50, label: 24, text: 2000 }
 
+// Speech-to-text settings (relay GET/PUT /settings). Key values are write-only: the relay only ever returns set/source/last4.
+export type SttProvider = 'elevenlabs' | 'grok' | 'whisper'
+export type KeyState = { set: boolean; source: 'app' | 'env' | null; last4: string | null }
+export type SttSettings = {
+  provider: SttProvider; fallback: boolean; order: SttProvider[]
+  providers: {
+    elevenlabs: { configured: boolean; key: KeyState; model: string }
+    grok: { configured: boolean; key: KeyState; endpoint: string }
+    whisper: { configured: boolean; backend: string; model: string }
+  }
+  checks?: Partial<Record<'elevenlabs' | 'xai', 'valid' | 'invalid' | 'unknown'>>
+}
+export type SttUpdate = { provider?: SttProvider; fallback?: boolean; keys?: { elevenlabs?: string; xai?: string }; clear?: ('elevenlabs' | 'xai')[] }
+
 export const cfg = { relayUrl: '', token: '' }
 
 async function call<T>(path: string, init: RequestInit = {}, timeoutMs = 100_000): Promise<T> {
@@ -23,7 +37,7 @@ async function call<T>(path: string, init: RequestInit = {}, timeoutMs = 100_000
     signal: AbortSignal.timeout(timeoutMs),
   })
   const j: any = await r.json().catch(() => ({}))
-  if (!r.ok) throw Object.assign(new Error(j.error ?? `HTTP ${r.status}`), { status: r.status })
+  if (!r.ok) throw Object.assign(new Error(j.error ?? `HTTP ${r.status}`), { status: r.status, body: j })
   return j as T
 }
 
@@ -48,8 +62,11 @@ export const api = {
   actions: () => call<{ actions: Action[] }>('/actions', {}, 20_000),
   saveActions: (actions: Action[]) =>
     call<{ actions: Action[] }>('/actions', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ actions }) }, 20_000),
+  settings: () => call<SttSettings>('/settings', {}, 20_000),
+  saveSettings: (u: SttUpdate) =>
+    call<SttSettings>('/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(u) }, 40_000),
   stt: (pcm: Uint8Array) =>
-    call<{ text: string }>('/stt', { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: new Blob([pcm as BlobPart], { type: 'application/octet-stream' }) }, 70_000),
+    call<{ text: string; provider?: SttProvider; fallbackFrom?: SttProvider[] }>('/stt', { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: new Blob([pcm as BlobPart], { type: 'application/octet-stream' }) }, 70_000),
 }
 
 export type StreamEvent =

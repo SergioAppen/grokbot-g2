@@ -3,7 +3,7 @@
 .env.*
 !.env.example
 bots.json
-# relay state: history, avatars, pair.json, actions.json (quick actions)
+# relay state: history, avatars, pair.json, actions.json (quick actions), secrets.json (keys set from the app), whisper-models/
 data/
 data/actions.json
 avatars-src/
@@ -20,6 +20,7 @@ dist/
 *.ehpk
 app/.env.production
 # local tool installs
+.whisper-venv/
 .node/
 tailscale/
 whisper.cpp/

@@ -2,13 +2,17 @@
 # Grok Bot G2 — self-hosted relay. All settings come from .env (copy .env.example).
 #
 #   ./run.sh setup          check Node, npm ci (relay/bdk + app + relay), create .env secrets if missing
-#   ./run.sh start          ensure the tunnel (TUNNEL_MODE), (re)start bdk + relay, print status
+#   ./run.sh start          ensure the tunnel (TUNNEL_MODE; starts our own tailscaled + Funnel if configured),
+#                           (re)start bdk + relay, print status
+#   ./run.sh ts-login       start our own tailscaled if configured and print the Tailscale login link / relay URL
 #   ./run.sh restart-relay  restart bdk + relay only (tunnel untouched)
+#   ./run.sh reload-relay   restart the relay only (bdk + tunnel untouched; e.g. after a git pull)
 #   ./run.sh stop           stop bdk + relay (+ cloudflared if this script started it)
 #   ./run.sh status         process status + public /health
 #   ./run.sh pair           print a one-time 6-digit pairing code (valid 10 min) for the phone app
 #   ./run.sh build          avatars + app build (relay URL baked in) + .ehpk + QR codes
 #   ./run.sh mock [stop]    offline test stack: mock bdk (:3199) + relay (:8799) with example history
+#   ./run.sh whisper        optional: install local Whisper STT (faster-whisper in ./.whisper-venv) + download the model
 #
 # Every process is started with setsid and tracked in run/<name>.pid; stop only kills those groups.
 set -euo pipefail
@@ -63,21 +67,47 @@ setup() {
 # ---------- tunnels ----------
 ts() { local bin=${TAILSCALE_BIN:-tailscale}; local a=(); [ -n "${TAILSCALE_SOCKET:-}" ] && a=(--socket="$TAILSCALE_SOCKET")
        if [ "${TAILSCALE_SUDO:-0}" = 1 ]; then sudo -n "$bin" "${a[@]}" "$@"; else "$bin" "${a[@]}" "$@"; fi; }
-ensure_tailscale() {
-  if ! ts status >/dev/null 2>&1; then
-    if [ -n "${TAILSCALED_BIN:-}" ] && [ -n "${TAILSCALE_STATE_DIR:-}" ]; then
-      # For hosts without a system tailscaled (containers): run our own. --statedir is required for Funnel certs.
-      echo "starting tailscaled…"
-      local sock=${TAILSCALE_SOCKET:-$TAILSCALE_STATE_DIR/tailscaled.sock}; export TAILSCALE_SOCKET=$sock
-      local pre=(); [ "${TAILSCALE_SUDO:-0}" = 1 ] && pre=(sudo -n)
-      "${pre[@]}" setsid nohup "$TAILSCALED_BIN" --state="$TAILSCALE_STATE_DIR/tailscaled.state" --statedir="$TAILSCALE_STATE_DIR" \
-        --socket="$sock" ${TAILSCALED_FLAGS:-} >> logs/tailscaled.log 2>&1 < /dev/null &
-      for i in $(seq 1 30); do ts status >/dev/null 2>&1 && break; sleep 1; done
-    fi
-    ts status >/dev/null 2>&1 || { echo "Tailscale is not up. Install it, run 'tailscale up' (login link), enable Funnel for this node, then retry." >&2; exit 1; }
+# Own tailscaled (no root/apt needed): TAILSCALED_BIN + TAILSCALE_STATE_DIR; its socket defaults to the state dir.
+[ -n "${TAILSCALE_STATE_DIR:-}" ] && [ -z "${TAILSCALE_SOCKET:-}" ] && export TAILSCALE_SOCKET="$TAILSCALE_STATE_DIR/tailscaled.sock"
+ts_running() { ts status --json >/dev/null 2>&1; }   # daemon reachable (logged in or not)
+ts_logged_in() { ts status >/dev/null 2>&1; }
+ts_dns() { ts status --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null; }
+start_tailscaled() {
+  ts_running && return 0
+  if [ -n "${TAILSCALED_BIN:-}" ] && [ -n "${TAILSCALE_STATE_DIR:-}" ]; then
+    # --statedir is required for Funnel HTTPS certs (without it: "no TailscaleVarRoot" -> TLS internal error).
+    echo "starting tailscaled…"
+    mkdir -p "$TAILSCALE_STATE_DIR"
+    local pre=(); [ "${TAILSCALE_SUDO:-0}" = 1 ] && pre=(sudo -n)
+    "${pre[@]}" setsid nohup "$TAILSCALED_BIN" --state="$TAILSCALE_STATE_DIR/tailscaled.state" --statedir="$TAILSCALE_STATE_DIR" \
+      --socket="$TAILSCALE_SOCKET" ${TAILSCALED_FLAGS:-} >> logs/tailscaled.log 2>&1 < /dev/null &
+    echo $! > run/tailscaled.pid
+    for i in $(seq 1 30); do ts_running && return 0; sleep 1; done
+    echo "tailscaled did not start; see logs/tailscaled.log" >&2; exit 1
   fi
+}
+ts_login() {  # ./run.sh ts-login: start tailscaled if needed and print the login URL for the user
+  start_tailscaled
+  if ts_logged_in; then echo "Tailscale is logged in. Relay URL: https://$(ts_dns)"; return 0; fi
+  : > logs/tailscale-login.log
+  ( ts up --hostname="${TAILSCALE_HOSTNAME:-grokbot-g2}" >> logs/tailscale-login.log 2>&1 < /dev/null & )
+  for i in $(seq 1 30); do grep -qo 'https://login.tailscale.com/[^ ]*' logs/tailscale-login.log && break; ts_logged_in && break; sleep 1; done
+  if ts_logged_in; then echo "Tailscale is logged in. Relay URL: https://$(ts_dns)"; return 0; fi
+  local url; url=$(grep -o 'https://login.tailscale.com/[^ ]*' logs/tailscale-login.log | head -1)
+  [ -n "$url" ] || { echo "no login URL yet; see logs/tailscale-login.log" >&2; exit 1; }
+  echo "Send this login link to the user (it signs this machine into their tailnet): $url"
+  echo "Then run ./run.sh ts-login again: it prints the relay URL (put it in RELAY_PUBLIC_URL)."
+}
+ensure_tailscale() {
+  start_tailscaled
+  ts_logged_in || { echo "Tailscale is not logged in: run ./run.sh ts-login (or 'tailscale up') and open the login link." >&2; exit 1; }
   if ! ts funnel status 2>/dev/null | grep -q "127.0.0.1:$RELAY_PORT"; then
-    ts funnel --bg "$RELAY_PORT" >/dev/null || { echo "Could not enable Funnel (is it allowed in your tailnet policy?)" >&2; exit 1; }
+    # If Funnel/HTTPS is not enabled for the tailnet yet, the CLI prints an admin link and waits: show it instead of hanging.
+    if ! timeout 25 bash -c "$(declare -f ts); ts funnel --bg $RELAY_PORT" > logs/funnel.log 2>&1; then
+      local url; url=$(grep -o 'https://login.tailscale.com/[^ ]*' logs/funnel.log | head -1)
+      echo "Could not enable Funnel.${url:+ The tailnet admin must allow it here: $url}" >&2
+      echo "(details: logs/funnel.log; then run ./run.sh start again)" >&2; exit 1
+    fi
   fi
 }
 ensure_cloudflare() {
@@ -146,6 +176,17 @@ PY
   node tools/qr.mjs "$U/app/" qr/qr-app.png
   echo "built app/grokbot-g2.ehpk (relay $U); dev QR: qr/qr-app.png"
 }
+whisper() {
+  # Local, free speech-to-text. CPU only, no compiler needed (prebuilt wheels). ~450 MB venv + ~145 MB "base" model.
+  local py=$ROOT/.whisper-venv/bin/python model=${WHISPER_MODEL_NAME:-base} dir=${WHISPER_MODEL_DIR:-$DATA_DIR/whisper-models}
+  if [ ! -x "$py" ]; then
+    if command -v uv >/dev/null; then uv venv -q --python 3.12 .whisper-venv && uv pip install -q --python "$py" faster-whisper
+    else python3 -m venv .whisper-venv && "$py" -m pip install -q faster-whisper; fi
+  fi
+  echo "downloading/loading the '$model' model into $dir …"
+  WHISPER_MODEL_DIR="$dir" "$py" -c "import os,sys;from faster_whisper import WhisperModel;WhisperModel(sys.argv[1],device='cpu',compute_type=os.environ.get('WHISPER_COMPUTE','float32'),download_root=sys.argv[2]);print('whisper ready')" "$model" "$dir"
+  echo "Pick it with STT_PROVIDER=whisper in .env or in the app (Settings → Voice), then ./run.sh reload-relay"
+}
 mock() {
   if [ "${1:-}" = stop ]; then stop_one mock-relay; stop_one mock-bdk; echo "mock stopped"; return; fi
   check_node
@@ -164,10 +205,13 @@ case "${1:-start}" in
   setup) setup;;
   start) check_node; ensure_tunnel; stop_one relay; stop_one bdk; start_bdk; start_relay; status;;
   restart-relay) check_node; stop_one relay; stop_one bdk; start_bdk; start_relay; status;;
+  reload-relay) check_node; stop_one relay; start_relay; status;;
   stop) stop_one relay; stop_one bdk; stop_one cloudflared; status;;
   status) status;;
   pair) pair;;
   build) build;;
   mock) shift; mock "${1:-}";;
-  *) echo "usage: $0 [setup|start|restart-relay|stop|status|pair|build|mock [stop]]"; exit 1;;
+  whisper) whisper;;
+  ts-login) ts_login;;
+  *) echo "usage: $0 [setup|start|ts-login|restart-relay|reload-relay|stop|status|pair|build|mock [stop]|whisper]"; exit 1;;
 esac

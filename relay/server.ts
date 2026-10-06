@@ -9,15 +9,15 @@
 //   GET  /history?bot=NAME            -> {messages:[{role,text,at}]}
 //   GET  /conversations               -> {conversations:[{name,id,last:{role,text,at}|null,count,avatar,hudAvatar}]} newest first
 //   GET  /avatars/NAME.png | NAME.hud.png  (96 px colour for the phone | 40 px 4-bit grey for the HUD)
-//   POST /stt  body = raw PCM s16le 16 kHz mono (application/octet-stream) or audio/wav -> {text, latencyMs}
+//   POST /stt  body = raw PCM s16le 16 kHz mono (application/octet-stream) or audio/wav -> {text, provider, latencyMs, fallbackFrom?}
+//   GET  /settings | PUT /settings {provider?, fallback?, keys?:{elevenlabs?,xai?}, clear?:[...]}  (write-only keys)
 //   POST /chat/stream {bot,text}      -> text/event-stream: status | message {index,text,ms} | done | error
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, statSync, rmSync, renameSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, statSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
-import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createStt, PROVIDERS, type Provider } from "./stt.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -42,11 +42,6 @@ const BDK_URL = `http://127.0.0.1:${process.env.BDK_PORT ?? 3100}`;
 const BDK_TOKEN = process.env.BDK_TOKEN ?? "";
 const BOTS_FILE = process.env.BOTS_FILE ?? join(ROOT, "bots.json");
 const DATA_DIR = process.env.DATA_DIR ?? join(ROOT, "data");
-const ELEVEN = () => process.env.ELEVENLABS_API_KEY ?? "";
-const STT_PROVIDER = (process.env.STT_PROVIDER ?? "elevenlabs").toLowerCase(); // elevenlabs | whisper | none
-const STT_MODEL = process.env.STT_MODEL ?? "scribe_v1";                         // ElevenLabs model id
-const WHISPER_BIN = process.env.WHISPER_BIN ?? "whisper-cli";                   // whisper.cpp CLI
-const WHISPER_MODEL = process.env.WHISPER_MODEL ?? "";                          // e.g. models/ggml-base.bin
 const TUNNEL_MODE = (process.env.TUNNEL_MODE ?? "tailscale-funnel").toLowerCase(); // tailscale-funnel | cloudflare | none
 const HISTORY_DIR = process.env.HISTORY_DIR ?? join(DATA_DIR, "history");
 const AVATAR_DIR = process.env.AVATAR_DIR ?? join(DATA_DIR, "avatars"); // built by tools/avatars.py
@@ -133,53 +128,9 @@ function replyText(res: any): string {
   return "";
 }
 
-// ---------- STT (ElevenLabs Scribe or local whisper.cpp) ----------
-function pcmToWav(pcm: Buffer, rate = 16000): Buffer {
-  const h = Buffer.alloc(44);
-  h.write("RIFF", 0); h.writeUInt32LE(36 + pcm.length, 4); h.write("WAVE", 8);
-  h.write("fmt ", 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
-  h.writeUInt32LE(rate, 24); h.writeUInt32LE(rate * 2, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
-  h.write("data", 36); h.writeUInt32LE(pcm.length, 40);
-  return Buffer.concat([h, pcm]);
-}
-async function transcribe(audio: Buffer, isWav: boolean, lang?: string): Promise<string> {
-  const wav = isWav ? audio : pcmToWav(audio);
-  if (STT_PROVIDER === "whisper") return transcribeWhisper(wav, lang);
-  if (STT_PROVIDER !== "elevenlabs") throw Object.assign(new Error("speech-to-text disabled (STT_PROVIDER=none)"), { status: 503 });
-  if (!ELEVEN()) throw Object.assign(new Error("No ELEVENLABS_API_KEY available"), { status: 503 });
-  const fd = new FormData();
-  fd.append("model_id", STT_MODEL);
-  if (lang) fd.append("language_code", lang);
-  fd.append("tag_audio_events", "false");
-  fd.append("file", new Blob([new Uint8Array(wav)], { type: "audio/wav" }), "speech.wav");
-  const r = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
-    method: "POST", headers: { "xi-api-key": ELEVEN() }, body: fd, signal: AbortSignal.timeout(60_000),
-  });
-  const j: any = await r.json().catch(() => ({}));
-  if (!r.ok) throw Object.assign(new Error(`ElevenLabs STT ${r.status}: ${JSON.stringify(j.detail ?? j).slice(0, 200)}`), { status: 502 });
-  return String(j.text ?? "").trim();
-}
-// whisper.cpp: expects 16 kHz mono 16-bit WAV, which is exactly what the glasses send (wrapped above).
-let whisperBusy: Promise<unknown> = Promise.resolve(); // one transcription at a time (CPU/RAM bound)
-function transcribeWhisper(wav: Buffer, lang?: string): Promise<string> {
-  if (!WHISPER_MODEL || !existsSync(WHISPER_MODEL)) {
-    return Promise.reject(Object.assign(new Error("WHISPER_MODEL not set or missing (see README: whisper.cpp)"), { status: 503 }));
-  }
-  const run = async () => {
-    const f = join(tmpdir(), `g2-stt-${process.pid}-${Date.now()}.wav`);
-    writeFileSync(f, wav);
-    try {
-      const out = await new Promise<string>((resolve, reject) =>
-        execFile(WHISPER_BIN, ["-m", WHISPER_MODEL, "-f", f, "-nt", "-np", "-l", lang || "auto"],
-          { timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
-          (err, stdout, stderr) => (err ? reject(Object.assign(new Error(`whisper failed: ${String(stderr || err.message).slice(-300)}`), { status: 502 })) : resolve(stdout))));
-      return out.replace(/\[[^\]]*\]/g, " ").replace(/\s+/g, " ").trim(); // drop [BLANK_AUDIO]-style tags
-    } finally { rmSync(f, { force: true }); }
-  };
-  const p = whisperBusy.then(run, run);
-  whisperBusy = p.catch(() => {});
-  return p;
-}
+// ---------- STT (relay/stt.ts: ElevenLabs Scribe, xAI Grok STT, local Whisper; write-only key settings) ----------
+const stt = createStt({ dataDir: DATA_DIR, root: ROOT, log });
+stt.prewarm();
 
 // ---------- HTTP ----------
 const CORS = {
@@ -207,6 +158,7 @@ const LIMITS: Record<string, { max: number; windowMs: number }> = {
   all: { max: 120, windowMs: 60_000 },
   chat: { max: 15, windowMs: 60_000 },
   stt: { max: 20, windowMs: 60_000 },
+  settings: { max: 10, windowMs: 10 * 60_000 }, // PUT /settings (key changes)
   static: { max: 120, windowMs: 60_000 },
 };
 const counters = new Map<string, { n: number; reset: number }>();
@@ -331,13 +283,31 @@ http.createServer(async (req, res) => {
       }
       return send(res, 405, { error: "GET or PUT" });
     }
+    if (url.pathname === "/settings") {
+      // STT provider + write-only API keys (ElevenLabs, xAI). Never returns key values (only set/source/last 4).
+      // CURSOR_API_KEY is not exposed here on purpose: it stays in the relay's .env.
+      if (req.method === "GET") return send(res, 200, stt.publicSettings());
+      if (req.method === "PUT") {
+        if (!hit("settings", ip)) return send(res, 429, { error: "too many settings changes; try again later" });
+        let body: any;
+        try { body = JSON.parse((await readBody(req, 16 * 1024)).toString() || "{}"); } catch { return send(res, 400, { error: "invalid JSON" }); }
+        try { return send(res, 200, await stt.updateSettings(body, ip)); }
+        catch (e: any) {
+          log("settings rejected", ip, String(e?.message ?? e).slice(0, 120)); // audit line: messages never contain key values
+          return send(res, e?.status ?? 400, { error: String(e?.message ?? e), ...(e?.checks ? { checks: e.checks } : {}) });
+        }
+      }
+      return send(res, 405, { error: "GET or PUT" });
+    }
     if (req.method === "POST" && url.pathname === "/stt") {
       const audio = await readBody(req);
       if (audio.length < 3200) return send(res, 400, { error: "audio too short" });
       const isWav = audio.subarray(0, 4).toString() === "RIFF";
-      const text = await transcribe(audio, isWav, url.searchParams.get("lang") ?? (req.headers["x-lang"] as string) ?? undefined);
-      log("stt", audio.length, "bytes", Date.now() - t0, "ms");
-      return send(res, 200, { text, latencyMs: Date.now() - t0 });
+      const only = url.searchParams.get("provider") as Provider | null; // tests: force one provider, no fallback
+      if (only && !(PROVIDERS as readonly string[]).includes(only)) return send(res, 400, { error: "provider must be elevenlabs, grok or whisper" });
+      const r = await stt.transcribe(audio, isWav, url.searchParams.get("lang") ?? (req.headers["x-lang"] as string) ?? undefined, only ?? undefined);
+      log("stt", r.provider, audio.length, "bytes", Date.now() - t0, "ms", r.fallbackFrom ? `fallback from ${r.fallbackFrom.join(",")}` : "");
+      return send(res, 200, { text: r.text, provider: r.provider, latencyMs: Date.now() - t0, ...(r.fallbackFrom ? { fallbackFrom: r.fallbackFrom } : {}) });
     }
     if (req.method === "POST" && url.pathname === "/chat/stream") {
       // Server-Sent Events over a POST (read it with fetch() + ReadableStream).
@@ -426,4 +396,4 @@ http.createServer(async (req, res) => {
     log("error", url.pathname, e?.message);
     return send(res, e?.status && e.status >= 400 && e.status < 600 ? e.status : 500, { error: String(e?.message ?? e) });
   }
-}).listen(PORT, "127.0.0.1", () => log(`relay listening on 127.0.0.1:${PORT} (stt=${STT_PROVIDER}, tunnel=${TUNNEL_MODE})`));
+}).listen(PORT, "127.0.0.1", () => log(`relay listening on 127.0.0.1:${PORT} (stt=${stt.provider()}, tunnel=${TUNNEL_MODE})`));

@@ -428,7 +428,8 @@ async function stopMic(send = true) {
   if (pcm.length < 16000) { show('Too short. Tap and speak, then tap again.', 'idle'); return }
   show('Transcribing…', 'transcribing')
   try {
-    const { text } = await api.stt(pcm)
+    const { text, provider, fallbackFrom } = await api.stt(pcm)
+    if (fallbackFrom?.length) ui.toast(`Speech-to-text: ${fallbackFrom.join(', ')} failed, used ${provider}`)
     if (!text) { show('Did not catch that. Tap to try again.', 'idle'); return }
     await sendPrompt(text)
   } catch (e) { S.overlay = ''; note(`Speech-to-text failed:\n${(e as Error).message}`) }
