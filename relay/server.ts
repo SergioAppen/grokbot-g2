@@ -3,7 +3,7 @@
 // GET /health, GET /app/* (static app) and POST /pair (one-time pairing code -> token)):
 //   GET  /health                      -> {ok}
 //   GET  /bots                        -> {bots:[{name,id,contacted?,lastContactAt?}], default}
-//   POST /chat   {bot,text,wait?}     -> {status:"finished"|"running", reply, bot, latencyMs}
+//   POST /chat   {bot,text,wait?,ping?} -> {status:"finished"|"running", reply, bot, latencyMs}  (ping: 1 per bot / 30 s, else 429)
 //   POST /check  {bot,wait?}          -> same shape; for replies still "running"
 //   POST /interrupt {bot}             -> {ok}
 //   GET  /history?bot=NAME            -> {messages:[{role,text,at,id,attn?}]}
@@ -14,7 +14,8 @@
 //   GET  /avatars/NAME.png | NAME.hud.png  (96 px colour for the phone | 40 px 4-bit grey for the HUD)
 //   POST /stt  body = raw PCM s16le 16 kHz mono (application/octet-stream) or audio/wav -> {text, provider, latencyMs, fallbackFrom?}
 //   GET  /settings | PUT /settings {provider?, fallback?, keys?:{elevenlabs?,xai?}, clear?:[...]}  (write-only keys)
-//   POST /chat/stream {bot,text}      -> text/event-stream: status | message {index,text,ms} | done | error
+//   POST /chat/stream {bot,text,ping?} -> text/event-stream: status | earlier | message {index,text,ms} | done | error
+//                                      (busy: 409 {working,since}; ping: 1 per bot / PING_GAP_S, else 429)
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { readFileSync, existsSync, writeFileSync, mkdirSync, statSync, renameSync } from "node:fs";
@@ -158,6 +159,12 @@ async function readBody(req: http.IncomingMessage, max = 20 * 1024 * 1024): Prom
 const busy = new Set<string>();
 const sync = createSync({ dataDir: DATA_DIR, historyDir: HISTORY_DIR, bots, bdkTool, log, busy });
 const setBusy = (bot: string, on: boolean) => { if (on) busy.add(bot); else busy.delete(bot); sync.setBusy(bot, on); };
+// Ping (v0.6.1): {ping: true} on /chat or /chat/stream marks a "status update?" message; at most one per bot every
+// PING_GAP_S seconds (default 30) so repeated taps don't spam the bot. Only pings that were actually sent count.
+const PING_GAP_MS = Number(process.env.PING_GAP_S ?? 30) * 1000;
+const lastPing = new Map<string, number>();
+const pingWait = (bot: string) => Math.max(0, Math.ceil(((lastPing.get(bot) ?? 0) + PING_GAP_MS - Date.now()) / 1000));
+const busyBody = (bot: string) => ({ error: "bot busy with a previous message; poll /check", working: true, since: sync.workingSince(bot) });
 
 // ---------- rate limiting (the relay is reachable from the public internet through the tunnel) ----------
 // Fixed-window counters per client IP and bucket.
@@ -337,13 +344,16 @@ http.createServer(async (req, res) => {
       if (!b) return send(res, 404, { error: `unknown bot "${body.bot}"` });
       const text = String(body.text ?? "").trim();
       if (!text) return send(res, 400, { error: "text required" });
-      if (busy.has(b.name)) return send(res, 409, { error: "bot busy with a previous message; poll /check" });
+      const ping = body.ping === true;
+      if (ping && pingWait(b.name)) return send(res, 429, { error: `pinged ${b.name} recently; try again in ${pingWait(b.name)} s`, retryAfter: pingWait(b.name), ping: true });
+      if (busy.has(b.name)) return send(res, 409, busyBody(b.name));
       setBusy(b.name, true);
       const t0 = Date.now();
       // Send first (wait 0 = send + one look) so "bot busy"/errors come back as a normal HTTP status.
       let r: any;
       try { r = await bdkTool("grokbot__ask", { agent: b.name, message: text, wait_seconds: 0 }, 60_000); }
-      catch (e: any) { setBusy(b.name, false); return send(res, e?.status === 409 ? 409 : 502, { error: String(e?.message ?? e) }); }
+      catch (e: any) { setBusy(b.name, false); return send(res, e?.status === 409 ? 409 : 502, e?.status === 409 ? { ...busyBody(b.name), error: String(e?.message ?? e) } : { error: String(e?.message ?? e) }); }
+      if (ping) { lastPing.set(b.name, Date.now()); log("ping", b.name); }
       res.writeHead(200, { ...CORS, "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store", "x-accel-buffering": "no", connection: "keep-alive" });
       res.flushHeaders?.();
       const ev = (event: string, data: unknown) => { if (!res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
@@ -395,11 +405,14 @@ http.createServer(async (req, res) => {
       if (url.pathname === "/chat") {
         const text = String(body.text ?? "").trim();
         if (!text) return send(res, 400, { error: "text required" });
-        if (busy.has(b.name)) return send(res, 409, { error: "bot busy with a previous message; poll /check" });
+        const ping = body.ping === true;
+        if (ping && pingWait(b.name)) return send(res, 429, { error: `pinged ${b.name} recently; try again in ${pingWait(b.name)} s`, retryAfter: pingWait(b.name), ping: true });
+        if (busy.has(b.name)) return send(res, 409, busyBody(b.name));
         setBusy(b.name, true);
         try {
-          pushHistory(b.name, { role: "user", text, at: Date.now() });
           const r = await bdkTool("grokbot__ask", { agent: b.name, message: text, wait_seconds: wait });
+          if (ping) { lastPing.set(b.name, Date.now()); log("ping", b.name); }
+          pushHistory(b.name, { role: "user", text, at: t0 }); // after a successful send (a 409 records nothing)
           const earlier = earlierTexts(r);
           for (const t of earlier) pushHistory(b.name, { role: "bot", text: t, at: t0 - 1 }, "earlier");
           const reply = replyText(r);

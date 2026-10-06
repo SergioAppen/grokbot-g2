@@ -7,9 +7,10 @@ import { api, cfg, type Action } from '../src/api'
 const h = new URLSearchParams(location.hash.slice(1))
 cfg.relayUrl = h.get('relay') || location.origin
 cfg.token = h.get('token') || ''
-const S = { bot: '', bots: [] as any[], phase: 'idle', screen: 'bots', pages: [] as string[], page: 0, convs: [] as any[], seen: {} as Record<string, number>, actions: [] as Action[] }
+const S = { bot: '', bots: [] as any[], phase: 'idle', screen: 'bots', pages: [] as string[], page: 0, convs: [] as any[], seen: {} as Record<string, number>, actions: [] as Action[], working: {} as Record<string, boolean>, pending: '' }
 const w = window as any
-w.__harness = { S, ui, errors: [] as string[] }
+let pingText = 'Any update? Give me a short status.'
+w.__harness = { S, ui, errors: [] as string[], pings: [] as string[] }
 window.addEventListener('error', (e) => w.__harness.errors.push(String(e.message)))
 window.addEventListener('unhandledrejection', (e) => w.__harness.errors.push(String((e as PromiseRejectionEvent).reason)))
 
@@ -22,6 +23,10 @@ ui.mount({
   onSaveSettings: async () => {},
   onSaveActions: async (list) => { const r = await api.saveActions(list); S.actions = r.actions; ui.renderActions(S); return r.actions },
   onFireAction: () => ui.toast('(harness: fire is a no-op)'),
+  // ping: recorded only (nothing is sent); a busy bot toggles the queued state like the real app
+  onPing: (b) => { w.__harness.pings.push(b); if (S.working[b] || S.pending === b) { S.pending = S.pending === b ? '' : b; ui.render(S) } else ui.toast(`(harness: ping ${b} recorded, not sent)`) },
+  pingText: () => pingText, defaultPing: 'Any update? Give me a short status.',
+  onSavePing: async (t) => { pingText = t.trim() || 'Any update? Give me a short status.' },
   cfg,
 })
 ;(async () => {

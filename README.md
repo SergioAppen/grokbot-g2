@@ -33,6 +33,10 @@ named tunnel) lets the phone reach that relay.
 |---|---|---|
 | ![HUD banner](docs/screenshots/hud-banner.png) | ![HUD card banner](docs/screenshots/hud-banner-card.png) | ![Phone live unread](docs/screenshots/phone-live-unread.png) |
 
+| HUD: ping a busy bot (read view) | HUD: ping queued (list) | Phone: Ping buttons (Ping / When idle / Queued ✕) |
+|---|---|---|
+| ![HUD ping busy](docs/screenshots/hud-ping-busy.png) | ![HUD ping queued](docs/screenshots/hud-ping-queued.png) | ![Phone ping list](docs/screenshots/phone-ping-list.png) |
+
 <sub>Screenshots come from the Even Hub simulator running the bundled mock bot (`./run.sh mock`). The bot names and avatars are generated examples.</sub>
 
 ## Features
@@ -63,6 +67,10 @@ named tunnel) lets the phone reach that relay.
   the list and the read view within seconds while the app is open. Unread counts per bot, a `※` marker for
   messages that look like they need you, and a short **banner on the glasses** (`● Bot: first words…`) on any
   screen. See *Sync and live updates*.
+- **Ping (v0.6.1):** ask a bot for a short status update with one gesture: hold a bot on the glasses list (or
+  glasses menu → *Ping for update*), or **Ping** on the phone. It sends a fixed message (default *Any update? Give
+  me a short status.*, editable in Settings) and streams the reply into the read view. A busy bot is not pinged:
+  you see what it is doing and can queue one ping for when it is idle. See *Ping*.
 - **Typed chat** with history on the phone screen, plus *Check reply*, *Interrupt* and *Re-ask* (glasses menu).
 - **Security:** bearer-token auth on every API route, one-time 6-digit **pairing codes** so the token never sits in
   the app package, per-IP and global **rate limits**, and lockout after repeated bad tokens.
@@ -189,14 +197,20 @@ wrong codes or tokens trigger rate limiting.
 
 | Screen | Swipe ▲ / ▼ | Tap | Double-tap | Hold |
 |---|---|---|---|---|
-| Conversation list | move selection | open (Quick actions or a bot's read view) | exit dialog | – |
+| Conversation list | move selection | open (Quick actions or a bot's read view) | exit dialog | **ping** that bot (see *Ping*) |
 | Read view | previous / next page, then previous / next message | start talking (tap again to send) | back to the list | push-to-talk (release sends) |
 | While listening | – | send | cancel | – |
 | Quick actions | move selection | send that message to its bot | back to the list | – |
 
 The read view never starts the microphone on its own; the footer always shows the available actions
-(`Tap: talk   ▲▼ read   2xTap: list`). The glasses menu (Even's context menu) adds *Bot list*, *Check for reply*,
-*Interrupt bot*, *Re-ask last*, *Mic: glasses/phone* and *Quick actions*.
+(`Tap: talk   ▲▼ read   2xTap: list`; `ping queued` in front while a deferred ping for that bot is waiting). The
+list header shows `Hold: ping` when there is room. The glasses menu (Even's context menu) adds *Bot list*,
+*Check for reply*, *Interrupt bot*, *Re-ask last*, *Mic: glasses/phone*, *Quick actions* and *Ping for update*
+(pings the bot you are reading, or the selected row on the list).
+
+**Why hold means different things:** in the read view, hold stays **push-to-talk** as before (changing it silently
+would make people send pings when they meant to talk), so the read view pings through the menu. On the list,
+hold had no function, so it is now ping.
 
 ## Quick actions
 
@@ -209,6 +223,40 @@ message (409), the read view says so; nothing is sent.
 The list lives in `data/actions.json` on the relay (git-ignored); on first run it is seeded from
 `actions.example.json`, keeping only actions whose bot exists in `bots.json`. The relay validates every save
 (array of ≤ 50, label ≤ 24, message ≤ 2000, known bot, 512 KB body cap).
+
+## Ping
+
+A ping sends one fixed message to a bot through the normal `/chat/stream` path and opens its read view with the
+reply streaming in (`» You: Any update? Give me a short status.`, then the bot's messages). Change the text on the
+phone: **⚙ Settings → Ping** (≤ 500 characters, stored on the phone; *Default* restores it).
+
+| Where | How |
+|---|---|
+| Glasses, conversation list | select a bot, **hold** |
+| Glasses, read view | glasses menu → **Ping for update** (hold stays push-to-talk) |
+| Phone, chat | **Ping** button in the header |
+| Phone, conversation list | small **Ping** button on each row (does not open the chat) |
+
+**Rate limit:** one ping per bot every 30 s. The app says `Pinged Coder 27 s ago · again in 4 s`; the relay
+enforces the same gap (`PING_GAP_S`, default 30) and answers `429 {retryAfter}`. A refused or failed ping does
+not use up the slot. Normal messages are not limited by this.
+
+**Busy bot** (the relay is streaming a turn for it, background sync sees it working, or the bot answered 409):
+nothing is sent, nothing is queued on the relay, and nothing retries in a loop. You see the status instead:
+
+- glasses list: header `… Research is still working (started 6 s ago) · Hold again: ping when idle`;
+- read view: `… Research is still working (started 8 s ago). Ping not sent. Menu → Ping for update again within
+  60 s to send it once Research is idle.`;
+- phone: the Ping button reads **Ping when idle** (header) / **When idle** (row).
+
+Pinging again within 60 s (phone: tapping *Ping when idle*) sets up **one deferred ping**: `ping queued` on the row
+and in the read-view footer, **Queued ✕** / **Cancel ping** on the phone. Ping again to cancel. The app sends it
+once, when `/events` reports the bot idle (within about a second of the turn ending when the relay ran the turn,
+otherwise within one sync poll) and nothing else of yours is in flight. If the bot turns out to be busy again at
+that moment (409), only the status is shown; it is not retried. The queued ping lives in the app (lost if the app
+closes) and expires after 30 minutes. If you are reading another bot when it fires, the reply shows as banners and
+in the list. "Started N ago" is when the relay first saw the bot working, so for turns started elsewhere it can be
+up to one sync poll late.
 
 ## Sync and live updates
 
@@ -321,8 +369,8 @@ All routes need `Authorization: Bearer <RELAY_TOKEN>` except `GET /health`, `GET
 | `GET /sync/status` | Background sync: interval, requests in the last hour, errors, backoff, per-bot state |
 | `GET /bots`, `GET /history?bot=` | Bot list; per-bot history |
 | `GET /actions` / `PUT /actions {actions:[{id?,label,bot,text}]}` | Quick actions (validated, stored in `data/actions.json`) |
-| `POST /chat/stream {bot,text}` | SSE: `status`, `earlier {texts}` (messages the bot sent before yours), one `message {index,text,ms}` per bot message, `done`, `error` |
-| `POST /chat {bot,text,wait?}` / `POST /check {bot,wait?}` | Non-streaming ask (returns `earlier` too) / poll for more (returns nothing while a stream for that bot is running). The app no longer polls `check` for messages a bot sent on its own: background sync does that |
+| `POST /chat/stream {bot,text,ping?}` | SSE: `status`, `earlier {texts}` (messages the bot sent before yours), one `message {index,text,ms}` per bot message, `done`, `error`. Busy bot → `409 {working, since}` (`since` = when the relay first saw it working, ms). `ping:true` marks a ping: max one per bot per `PING_GAP_S` (30 s) → `429 {retryAfter, ping}` |
+| `POST /chat {bot,text,wait?,ping?}` / `POST /check {bot,wait?}` | Non-streaming ask (returns `earlier` too) / poll for more (returns nothing while a stream for that bot is running). The app no longer polls `check` for messages a bot sent on its own: background sync does that |
 | `POST /interrupt {bot}` | Interrupt the bot's current turn |
 | `POST /stt[?provider=&lang=]` | Raw 16 kHz s16le mono PCM or WAV → `{text, provider, latencyMs, fallbackFrom?}` (`provider=` forces one provider, no fallback) |
 | `GET /settings` / `PUT /settings` | STT provider, fallback and write-only ElevenLabs / xAI keys (see above); never returns key values |
@@ -370,7 +418,7 @@ tail -f logs/relay.log logs/bdk.log
 - **Live updates need the app open:** sync runs on the relay all the time, but the phone/glasses only get the
   banner while the Even app is running the G2 app (no push notifications).
 - **Busy bots return 409:** if a bot is still working on an earlier message (from any client), nothing is sent.
-  Use *Check reply* or wait.
+  Use *Check reply* or wait, or queue a ping (see *Ping*; the queued ping is kept by the app, not the relay).
 - **Message-level streaming only:** the Grok Bot extension exposes whole messages, not word-by-word deltas.
   Each message appears within ~0.5–2 s of the bot sending it.
 - **Exact bot names:** names in `bots.json` must match Grok Bot exactly, or a new empty bot is created.
@@ -387,6 +435,9 @@ tail -f logs/relay.log logs/bdk.log
   `POST /mock/fail {"status":429,"n":2}` makes the next peeks fail.
 - Sync test (mock only): `SYNC_ACTIVE_MS=3000 SYNC_IDLE_MS=10000 ./run.sh mock && node tools/sync-test.mjs`
   (SSE events, merge/dedupe, earlier replies, cards, resume, unread/seen, 429 backoff; expect `23/23 passed`).
+- Ping test (mock only, mock stack running): `node tools/ping-test.mjs` (ping streams; a second ping within 30 s
+  → 429 and nothing recorded; a normal message is not limited; a busy bot → 409 with `working`/`since` and nothing
+  recorded; the ping goes through after the turn ends; expect `7/7 passed`).
 - Pagination self-test: `cd app && npx esbuild test/paginate.test.ts --bundle --platform=node --format=esm
   --loader:.txt=text --outfile=/tmp/pt.mjs && node /tmp/pt.mjs` (every page fits, no text lost, last words on
   the last page).
@@ -395,7 +446,8 @@ tail -f logs/relay.log logs/bdk.log
 - Phone UI layout/keyboard test (mock stack running): `tools/phone-test.sh` builds `app/test/phone-harness.ts`
   (the phone screen without the Even bridge) and checks it in headless **WebKit** and Chromium at 390×844 and
   375×667, with the on-screen keyboard simulated by halving the viewport: the new quick action's editor, the
-  voice key fields and the chat composer must stay visible, with no JS errors. Screenshots go to
+  voice key fields and the chat composer must stay visible, the Ping buttons/labels (Ping, When idle, Queued ✕,
+  Ping when idle) and the Settings ping message must work (pings are only recorded, never sent), with no JS errors. Screenshots go to
   `test/sim/phone_*.png`. It refuses anything but the mock relay. Add `?debug` to the app URL (or tick
   *Show app errors on screen* in Settings) to get uncaught errors as a red banner on the phone.
 - Typecheck: `(cd relay && npm run check)`, `(cd relay/bdk && npm run check)`, `(cd app && npm run build)`.

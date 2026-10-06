@@ -133,6 +133,8 @@ curl -s -H "authorization: Bearer $RELAY_TOKEN" http://127.0.0.1:8799/settings |
 - Check: `/settings` shows `provider`, `order` and per key only `set` / `source` / `last4`.
 - Sync (mock only): `./run.sh mock stop; SYNC_ACTIVE_MS=3000 SYNC_IDLE_MS=10000 ./run.sh mock && node tools/sync-test.mjs`
   → `23/23 passed` (proactive messages arrive over `/events`, no duplicates, cards as placeholders, backoff).
+- Ping (mock only, same mock stack): `node tools/ping-test.mjs` → `7/7 passed` (429 rate limit, 409 busy with
+  `since`, refused pings not recorded).
 
 ### 6. Tailscale Funnel (stable public HTTPS URL)
 
@@ -374,7 +376,11 @@ Expect `N/N passed`; screenshots go to `test/sim/phone_*.png`.
 
 - Glasses: tap a conversation to **read** it (history first, starting at the first unread message). Swipe ▲▼ to
   page through messages; **tap** to talk (tap again to send), **double-tap** to go back (or cancel while
-  listening), **hold** for push-to-talk. The footer always shows the gestures. `↓ n new` means messages arrived
+  listening), **hold** for push-to-talk. The footer always shows the gestures. **Ping** asks a bot for a short
+  status: on the glasses list **hold** a bot; in the read view use the glasses menu → *Ping for update* (hold there
+  stays push-to-talk); on the phone tap **Ping** (chat header or list row). One per bot per 30 s; a busy bot is
+  not pinged, they see its status and can ping again to queue one ping for when it is idle (ping again cancels).
+  The ping text is in phone **⚙ Settings → Ping**. `↓ n new` means messages arrived
   below where you are reading. Messages from the Grok Bot apps and routines appear within seconds while the app
   is open (`· live` in the phone status line), with a short banner on the glasses; `※` means a message looks
   like it needs them (a question, or a card/file they have to open in the Grok Bot app: options, approvals and
@@ -401,6 +407,7 @@ Run these and report each result to the user:
 | 8 | Quick action | phone → ⚡ → *+ Add action* (new editor opens at the top, label focused) → add one for a bot the user picks; glasses → Quick actions → tap (mock in the simulator first) | reply streams into that bot's read view (409 = bot busy, nothing sent) |
 | 9 | Voice | user: read view → tap, speak, tap | transcript is sent and the reply appears |
 | 10 | Sync | `tools/sync-test.mjs` on the mock (step 5), then `GET /sync/status` on the real relay | `23/23 passed`; every bot backfilled, `errors` 0, sane `requestsLastHour` |
+| 11 | Ping | `node tools/ping-test.mjs` on the mock; then the user pings one bot of their choice from the glasses list (hold) | `7/7 passed`; the reply streams into the read view, a second ping within 30 s shows `again in N s` |
 
 ## Troubleshooting
 

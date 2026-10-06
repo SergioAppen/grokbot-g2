@@ -142,8 +142,16 @@ export function createSync(o: Opts) {
     req.on("close", done); res.on("close", done);
     if (wasIdle) kick(); // a client just connected: poll soon at the active rate
   }
-  const botStatus = () => Object.fromEntries(o.bots().map((b) => [b.name, { busy: o.busy.has(b.name), working: !!(bs(b.name).turn?.inFlight || (bs(b.name).turn?.queued ?? 0) > 0) }]));
-  function setBusy(bot: string, busy: boolean) { emit("bot-status", { bot, busy, working: !!bs(bot).turn?.inFlight, source: "relay" }); }
+  // When each bot's current turn was first seen (relay stream start, or the poll that first saw it working; so a
+  // turn started elsewhere is dated to within one poll interval). Shown as "still working (started 3m ago)".
+  const since: Record<string, number> = {};
+  const isWorking = (bot: string) => !!(bs(bot).turn?.inFlight || (bs(bot).turn?.queued ?? 0) > 0);
+  function track(bot: string) {
+    if (o.busy.has(bot) || isWorking(bot)) since[bot] ??= Date.now(); else delete since[bot];
+    return since[bot];
+  }
+  const botStatus = () => Object.fromEntries(o.bots().map((b) => [b.name, { busy: o.busy.has(b.name), working: isWorking(b.name), since: since[b.name] }]));
+  function setBusy(bot: string, busy: boolean) { emit("bot-status", { bot, busy, working: isWorking(bot), since: track(bot), source: "relay" }); }
 
   // ---------- merge ----------
   function toMsg(e: Entry): Msg | null {
@@ -206,7 +214,8 @@ export function createSync(o: Opts) {
     const wasWorking = !!(st.turn?.inFlight || (st.turn?.queued ?? 0) > 0);
     st.turn = r.turn ?? null;
     const working = !!(st.turn?.inFlight || (st.turn?.queued ?? 0) > 0);
-    if (working !== wasWorking) emit("bot-status", { bot, busy: o.busy.has(bot), working, source: "sync" });
+    track(bot);
+    if (working !== wasWorking) emit("bot-status", { bot, busy: o.busy.has(bot), working, since: since[bot], source: "sync" });
     const added = merge(bot, r.entries ?? []);
     st.cursor = r.latestUpdatedSeq ?? st.cursor;
     st.lastPoll = Date.now();
@@ -277,5 +286,5 @@ export function createSync(o: Opts) {
       bots: Object.fromEntries(o.bots().map((b) => { const s = bs(b.name); return [b.name, { backfilled: !!s.backfilled, lastPoll: s.lastPoll, lastActivity: s.lastActivity, disabled: s.disabled, working: !!s.turn?.inFlight }]; })),
     };
   }
-  return { history, pushHistory, unread, unreadAttn, setSeen, seenAt: (bot: string) => seen[bot] ?? 0, addClient, setBusy, start, status, kick, merge };
+  return { history, pushHistory, unread, unreadAttn, workingSince: (bot: string) => since[bot], setSeen, seenAt: (bot: string) => seen[bot] ?? 0, addClient, setBusy, start, status, kick, merge };
 }

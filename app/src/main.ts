@@ -42,6 +42,9 @@ const S = {
   micSource: AudioInputSource.Glasses as AudioInputSource,
   working: {} as Record<string, boolean>, // bot busy with a turn (relay stream or elsewhere, from /events)
   live: false,                   // /events connected
+  workingSince: {} as Record<string, number>, // when each busy bot's turn started (relay clock + skew)
+  pending: '' as string,         // bot with a deferred ping (sent once when it goes idle), '' = none
+  pendingAt: 0,
 }
 let pcmChunks: Uint8Array[] = []
 let pcmBytes = 0
@@ -75,6 +78,8 @@ async function markSeen(name: string) {
   if (cfg.token) api.seen(name).catch(() => { /* offline: the relay's unread count catches up next time */ })
 }
 S.micSource = (await store.get('mic')) === 'phone' ? AudioInputSource.Phone : AudioInputSource.Glasses
+export const DEFAULT_PING = 'Any update? Give me a short status.'
+let pingText = (await store.get('pingText')) || DEFAULT_PING
 
 // ───────────────────────── glasses rendering ─────────────────────────
 // Serialize all bridge writes; the BLE render queue is slow.
@@ -132,7 +137,9 @@ function header(): string {
     if (!cfg.token) return 'NOT PAIRED · phone screen → Settings → code'
     const n = listRows().length, w = winStart()
     const unread = S.convs.filter(isUnread).length
-    return `CHATS${unread ? `  ● ${unread} new` : ''}   ${w + 1}-${Math.min(n, w + ROWS)}/${n}  ▲▼`
+    const base = `CHATS${unread ? `  ● ${unread} new` : ''}   ${w + 1}-${Math.min(n, w + ROWS)}/${n}  ▲▼`
+    const hint = `${base}   Hold: ping` // shown only when it fits
+    return textWidth(hint) <= TEXT_W - 8 ? hint : base
   }
   if (S.screen === 'actions') {
     const n = S.actions.length
@@ -153,7 +160,7 @@ function footer(): string {
   if (S.screen === 'actions') return S.actions.length ? 'Tap: send   2xTap: back' : '2xTap: back'
   if (S.screen !== 'chat') return ''
   const n = newCount()
-  const hint = n ? `↓ ${n} new  ` : ''
+  const hint = (S.pending === S.bot ? 'ping queued  ' : '') + (n ? `↓ ${n} new  ` : '')
   if (S.phase === 'listening') return 'Tap: send   2xTap: cancel'
   if (S.phase === 'transcribing' || S.phase === 'sending' || S.phase === 'thinking' || S.phase === 'streaming') return fit(`${hint}▲▼ read   2xTap: list`)
   return fit(`${hint}Tap: talk   ▲▼ read   2xTap: list`)
@@ -197,7 +204,7 @@ function rowContent(r: Row | undefined, selected: boolean): string {
   const when = c.last ? `  · ${relTime(c.last.at)}` : ''
   const prev = c.last ? `${c.last.role === 'user' ? 'You: ' : ''}${sanitize(c.last.text).replace(/\s+/g, ' ')}` : 'No messages yet'
   const dot = isUnread(c) ? (c.attn || c.last?.attn ? '  ※' : '  ●') + ((c.unread ?? 0) > 1 ? ` ${c.unread}` : '') : ''
-  const busy = S.working[c.name] ? '  …' : ''
+  const busy = S.pending === c.name ? '  … ping queued' : S.working[c.name] ? '  …' : ''
   return `${fit(`${mark}${c.name}${dot}${busy}${when}`, 500)}\n${fit(`   ${prev}`, 500)}`
 }
 function botsPage() {
@@ -304,6 +311,7 @@ const MENU = { menuItems: [
   { itemID: 4, itemName: 'Re-ask last' },
   { itemID: 5, itemName: 'Mic: glasses/phone' },
   { itemID: 6, itemName: 'Quick actions' },
+  { itemID: 7, itemName: 'Ping for update' },
 ] }
 
 let started = false
@@ -460,7 +468,7 @@ async function stopMic(send = true) {
 }
 
 let inflight = false
-export async function sendPrompt(text: string, bot = S.bot) {
+export async function sendPrompt(text: string, bot = S.bot, opts: { ping?: boolean } = {}) {
   if (inflight) { ui.toast('Still waiting for the previous reply'); return }
   inflight = true
   S.lastPrompt = text
@@ -492,14 +500,14 @@ export async function sendPrompt(text: string, bot = S.bot) {
         } else if (e.type === 'error') {
           throw Object.assign(new Error(e.error), { status: e.status })
         }
-      })
+      }, opts.ping)
       if ((S.phase as Phase) !== 'reply') setPhase('reply') // stream ended without "done"
     } catch (e) {
       const err = e as Error & { status?: number }
-      if (streamed || err.status === 409) throw err
+      if (streamed || err.status === 409 || err.status === 429) throw err
       // Fallback: non-streaming /chat (+ /check polling)
       setPhase('thinking')
-      const reply = await askAndWait(bot, text)
+      const reply = await askAndWait(bot, text, undefined, opts.ping)
       ui.addMessage({ role: 'bot', text: reply, at: Date.now() })
       S.phase = 'reply'
       addItem({ role: 'bot', text: reply, at: Date.now() })
@@ -507,8 +515,14 @@ export async function sendPrompt(text: string, bot = S.bot) {
     console.log(`reply in ${Date.now() - t0} ms`)
     loadConvs()
   } catch (e) {
-    const err = e as Error & { status?: number }
-    note(err.status === 409 ? `${bot} is busy with an earlier message.\nWait for it to finish, or Menu → Check for reply.` : `Error: ${err.message}`)
+    const err = e as Error & { status?: number; body?: any }
+    if (opts.ping && (err.status === 409 || err.status === 429)) {
+      // The user message we optimistically showed was not sent: drop it, then say why.
+      let k = -1; for (let i = S.items.length - 1; i >= 0; i--) if (S.items[i].role === 'user' && S.items[i].text === text) { k = i; break }
+      if (k >= 0) { S.items.splice(k, 1); S.mi = Math.min(S.mi, Math.max(0, S.items.length - 1)); S.pi = 0 }
+      if (err.status === 409) { noteSince(bot, err.body?.since); inflight = false; pingBusy(bot, 'glasses', true); return }
+      note(`Pinged ${bot} recently.\nTry again in ${err.body?.retryAfter ?? 30} s.`, 'idle')
+    } else note(err.status === 409 ? `${bot} is busy with an earlier message.\nWait for it to finish, or Menu → Check for reply.` : `Error: ${err.message}`)
   } finally { inflight = false }
 }
 async function checkReply() {
@@ -530,6 +544,90 @@ async function toggleMicSource() {
   if (S.screen === 'chat') show(`Mic: ${S.micSource === AudioInputSource.Phone ? 'phone' : 'glasses'}`, S.phase === 'listening' ? 'idle' : S.phase)
 }
 
+// ───────────────────────── ping ─────────────────────────
+// Ping = send a short fixed "status?" message (editable in phone Settings) through the normal /chat/stream path,
+// then show the reply in the bot's read view. Glasses: hold a bot row on the list, or Menu → Ping for update.
+// Phone: Ping in the chat header or on a list row. Max one per bot every 30 s (also enforced by the relay).
+// Busy bot: nothing is sent. The status we know is shown; pinging again within 60 s (phone: the "Ping when idle"
+// button) queues ONE deferred ping, sent when /events reports the bot idle; ping again to cancel; expires in 30 min.
+const PING_GAP_MS = 30_000, OFFER_MS = 60_000, PENDING_MAX_MS = 30 * 60_000
+const lastPing: Record<string, number> = {}
+let pingOffer: { bot: string; until: number } | null = null
+let skew = 0 // local clock − relay clock (from /events hello)
+const busyHint: Record<string, number> = {} // a 409 says "busy" before /events does; trusted for 2 min
+const isBusy = (bot: string) => !!S.working[bot] || (busyHint[bot] ?? 0) > Date.now() || (inflight && S.bot === bot)
+function agoText(t: number): string {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000))
+  return s < 60 ? `${s} s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min ago`
+}
+function noteSince(bot: string, since?: number) { if (since) S.workingSince[bot] = since + skew; busyHint[bot] = Date.now() + 120_000 }
+export function busyText(bot: string): string {
+  const since = S.workingSince[bot]
+  return `… ${bot} is still working${since ? ` (started ${agoText(since)})` : ''}`
+}
+/** Short notice: in the read view when possible, else as a header banner (never switches screens mid-turn). */
+async function tell(bot: string, text: string, short?: string) {
+  ui.toast(text.replace(/\n/g, ' '))
+  // On the glasses list, stay there: one-line header banner (the next Hold on the same row is the follow-up ping).
+  if (short && S.screen === 'bots') { showBanner(bot, fit(short)); return }
+  if (inflight || S.phase === 'listening' || S.phase === 'transcribing') { showBanner('', fit(text.split('\n')[0])); return }
+  if (S.screen !== 'chat' || S.bot !== bot) await openBot(bot, { quiet: true })
+  note(text, 'idle')
+}
+export async function ping(bot: string, from: 'glasses' | 'phone') {
+  if (S.phase === 'listening' || S.phase === 'transcribing') { ui.toast('Finish recording first'); return }
+  if (S.pending === bot) { S.pending = ''; pingOffer = null; await tell(bot, `Queued ping to ${bot} cancelled.`, `Queued ping to ${bot} cancelled`); return }
+  const wait = Math.ceil((((lastPing[bot] ?? 0) + PING_GAP_MS) - Date.now()) / 1000)
+  if (wait > 0) { showBanner(bot, fit(`Pinged ${bot} ${agoText(lastPing[bot])} · again in ${wait} s`)); ui.toast(`Pinged ${bot} recently; try again in ${wait} s`); return }
+  if (isBusy(bot)) return pingBusy(bot, from)
+  if (inflight) { showBanner('', fit(`Still waiting for ${S.bot}'s reply`)); ui.toast(`Still waiting for ${S.bot}'s reply; ping ${bot} after it`); return }
+  pingOffer = null
+  lastPing[bot] = Date.now()
+  await sendPrompt(pingText, bot, { ping: true })
+}
+/** Busy: show the status; offer (glasses) or set up (phone, second ping) the single deferred ping. */
+async function pingBusy(bot: string, from: 'glasses' | 'phone', fromSend = false) {
+  const status = busyText(bot)
+  const onList = S.screen === 'bots'
+  const again = from === 'phone' ? 'Tap "Ping when idle"' : onList ? 'Hold again' : 'Menu → Ping for update again'
+  if (!S.live) { await tell(bot, `${status}.\nPing not sent. Try again when it is done.`, `${status} · not sent`); return }
+  const offered = pingOffer?.bot === bot && Date.now() < pingOffer.until
+  if (!fromSend && (from === 'phone' || offered)) {
+    S.pending = bot; S.pendingAt = Date.now(); pingOffer = null
+    await tell(bot, `${status}.\nPing queued: sent once when ${bot} is idle.\nPing again to cancel.`, `Ping queued for ${bot} · Hold again: cancel`)
+    return
+  }
+  pingOffer = { bot, until: Date.now() + OFFER_MS }
+  await tell(bot, `${status}.\nPing not sent. ${again} within 60 s\nto send it once ${bot} is idle.`, `${status} · Hold again: ping when idle`)
+}
+/** Deferred ping: fire once when the bot is idle (from /events), never retried. */
+async function checkPending() {
+  const bot = S.pending
+  if (!bot) return
+  if (Date.now() - S.pendingAt > PENDING_MAX_MS) { S.pending = ''; ui.toast(`Queued ping to ${bot} expired`); redrawHeader(); return }
+  if (!S.live || isBusy(bot) || inflight || S.phase === 'listening' || S.phase === 'transcribing') return
+  if (Date.now() - (lastPing[bot] ?? 0) < PING_GAP_MS) return
+  S.pending = ''
+  lastPing[bot] = Date.now()
+  if (S.screen === 'chat' && S.bot === bot) { await sendPrompt(pingText, bot, { ping: true }); return }
+  // Not reading that bot: send in the background; its replies show as banners and in the list (the relay records them).
+  showBanner(bot, fit(`● ${bot}: queued ping sent`))
+  try {
+    await chatStream(bot, pingText, (e) => {
+      if (e.type === 'message') showBanner(bot, bannerText(bot, { role: 'bot', text: e.text, at: Date.now() }))
+      else if (e.type === 'error') throw Object.assign(new Error(e.error), { status: e.status })
+    }, true)
+  } catch (e) {
+    const err = e as Error & { status?: number; body?: any }
+    if (err.status === 409) { noteSince(bot, err.body?.since); showBanner(bot, fit(`${busyText(bot)} · queued ping not sent`)) }
+    else showBanner(bot, fit(`Queued ping to ${bot} failed: ${err.message}`))
+  }
+  loadConvsSoon()
+}
+window.setInterval(checkPending, 3000)
+export async function setPingText(t: string) { pingText = t.trim().slice(0, 500) || DEFAULT_PING; await store.set('pingText', pingText === DEFAULT_PING ? '' : pingText) }
+export const getPingText = () => pingText
+
 // ───────────────────────── events ─────────────────────────
 const typeOf = (e?: { eventType?: OsEventTypeList }) => (e ? e.eventType ?? OsEventTypeList.CLICK_EVENT : null)
 let cleanedUp = false
@@ -549,6 +647,11 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
     else if (id === 4 && S.lastPrompt) sendPrompt(S.lastPrompt)
     else if (id === 5) toggleMicSource()
     else if (id === 6) openActions()
+    else if (id === 7) {
+      const r = listRows()[S.sel]
+      const bot = S.screen === 'bots' ? (r?.kind === 'conv' ? r.c.name : '') : S.bot
+      if (bot) ping(bot, 'glasses')
+    }
     return
   }
   const sys = typeOf(event.sysEvent), txt = typeOf(event.textEvent), lst = typeOf(event.listEvent)
@@ -571,7 +674,8 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
   if (S.screen === 'bots') {
     if (t === OsEventTypeList.SCROLL_TOP_EVENT) return moveSel(-1)
     if (t === OsEventTypeList.SCROLL_BOTTOM_EVENT) return moveSel(1)
-    if (t === OsEventTypeList.CLICK_EVENT && !fresh && bannerOn()) { const b = banner!.bot; banner = null; openBot(b); return }
+    if (t === OsEventTypeList.LONG_PRESS_EVENT && !fresh) { const r = listRows()[S.sel]; if (r?.kind === 'conv') ping(r.c.name, 'glasses'); return }
+    if (t === OsEventTypeList.CLICK_EVENT && !fresh && bannerOn() && banner!.bot) { const b = banner!.bot; banner = null; openBot(b); return }
     if (t === OsEventTypeList.CLICK_EVENT && !fresh) {
       const r = listRows()[S.sel]
       if (r?.kind === 'actions') openActions()
@@ -627,6 +731,11 @@ ui.mount({
     return r.actions
   },
   onFireAction: (a) => fireAction(a),
+  onPing: (bot) => ping(bot, 'phone'),
+  pingText: () => pingText,
+  defaultPing: DEFAULT_PING,
+  onSavePing: (t) => setPingText(t),
+  busyText,
   cfg,
 })
 
@@ -679,10 +788,22 @@ let convTimer: number | null = null
 const loadConvsSoon = () => { if (convTimer === null) convTimer = window.setTimeout(() => { convTimer = null; loadConvs() }, 400) }
 function onRelayEvent(e: RelayEvent) {
   if (DEBUG) console.log('[event]', JSON.stringify(e).slice(0, 200))
-  if (e.type === 'hello') { S.working = Object.fromEntries(Object.entries(e.bots).map(([k, v]) => [k, v.busy || v.working])); loadConvsSoon(); return }
+  if (e.type === 'hello') {
+    skew = Date.now() - e.now
+    S.working = Object.fromEntries(Object.entries(e.bots).map(([k, v]) => [k, v.busy || v.working]))
+    S.workingSince = {}
+    for (const [k, v] of Object.entries(e.bots)) if (v.since) S.workingSince[k] = v.since + skew
+    loadConvsSoon(); return
+  }
   if (e.type === 'reset') { loadConvsSoon(); if (S.screen === 'chat' && !inflight) reloadOpen(); return }
   if (e.type === 'unread') { const c = S.convs.find((x) => x.name === e.bot); if (c) { c.unread = e.unread; c.attn = !!e.attn; if (S.screen === 'bots') refreshList() } return }
-  if (e.type === 'bot-status') { S.working[e.bot] = e.busy || e.working; if (S.screen === 'bots') refreshList(); return }
+  if (e.type === 'bot-status') {
+    S.working[e.bot] = e.busy || e.working
+    if (S.working[e.bot] && e.since) S.workingSince[e.bot] = e.since + skew; else if (!S.working[e.bot]) { delete S.workingSince[e.bot]; delete busyHint[e.bot] }
+    if (S.screen === 'bots') refreshList(); else ui.render(S)
+    if (!S.working[e.bot] && S.pending === e.bot) window.setTimeout(checkPending, 500)
+    return
+  }
   if (e.type !== 'message') return
   const { bot, msg, origin } = e
   // Conversation list: newest message + order (instant), then the relay's view (debounced).

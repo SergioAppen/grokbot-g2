@@ -2,7 +2,7 @@
 import { api, avatarUrl, relTime, ACTION_LIMITS, type Action, type Msg, type Bot, type Conversation, type SttSettings, type SttUpdate } from './api'
 
 type Handlers = {
-  state: { bot: string; bots: Bot[]; phase: string; screen: string; pages: string[]; page: number; convs: Conversation[]; seen: Record<string, number>; actions: Action[]; working?: Record<string, boolean> }
+  state: { bot: string; bots: Bot[]; phase: string; screen: string; pages: string[]; page: number; convs: Conversation[]; seen: Record<string, number>; actions: Action[]; working?: Record<string, boolean>; pending?: string }
   onSend: (text: string, bot: string) => void
   onPickBot: (bot: string) => void
   onBack: () => void
@@ -12,9 +12,17 @@ type Handlers = {
   onSaveSettings: (relayUrl: string, token: string, pairCode: string) => void
   onSaveActions: (actions: Action[]) => Promise<Action[]>
   onFireAction: (a: Action) => void
+  onPing?: (bot: string) => void
+  pingText?: () => string
+  defaultPing?: string
+  onSavePing?: (text: string) => Promise<void>
+  busyText?: (bot: string) => string
   cfg: { relayUrl: string; token: string }
 }
 let H: Handlers
+/** Ping button text: queued (tap cancels) / bot busy (tap queues one ping for when it is idle) / normal. */
+const pingLabel = (S: Handlers['state'], bot: string, long: boolean) =>
+  S.pending === bot ? (long ? 'Cancel ping' : 'Queued ✕') : S.working?.[bot] ? (long ? 'Ping when idle' : 'When idle') : 'Ping'
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!)
 let messages: Msg[] = []
@@ -64,7 +72,8 @@ button{background:var(--s);cursor:pointer}button.primary{background:var(--a);col
 .c .tm{font-size:12px;color:var(--d)}.c .tm.new{color:var(--a)}.c .pv{font-size:14px;color:var(--d);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .c .dot{width:10px;height:10px;border-radius:50%;background:var(--a);flex:none}.c .cnt{min-width:20px;height:20px;padding:0 6px;border-radius:10px;background:var(--a);color:#111;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex:none}.c .cnt.attn{background:#ffb347}.c .wk{font-size:12px;color:var(--a);font-weight:400}
 .chathead{display:flex;gap:10px;align-items:center}.chathead img{width:36px;height:36px;border-radius:50%;object-fit:cover}
-.chathead h1{font-size:18px}#back{padding:8px 12px}
+.chathead h1{font-size:18px}#back{padding:8px 12px}.chathead #ping{margin-left:auto}
+.c .pg{flex:none;font-size:12px;padding:6px 9px;border-radius:14px}.c .pg.q{border-color:#ffb347;color:#ffb347}.pingset{margin-top:14px}.pingset textarea{width:100%}
 .hidden{display:none!important}
 .qa{background:var(--s);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:6px}
 .qa .r{display:flex;gap:6px}.qa .r input{flex:1;min-width:0}.qa .r select{flex:1;min-width:0}.qa textarea{width:100%;resize:vertical;min-height:56px}
@@ -146,7 +155,7 @@ export const ui = {
         <div id="list"></div>
       </section>
       <section id="vchat" class="view hidden">
-        <div class="chathead"><button id="back">‹ Chats</button><img id="cav" alt=""><h1 id="cname"></h1></div>
+        <div class="chathead"><button id="back">‹ Chats</button><img id="cav" alt=""><h1 id="cname"></h1><button id="ping" class="hbtn" title="Ask this bot for a short status update">Ping</button></div>
         <div id="status2"></div>
         <div id="hud" title="Glasses preview"></div>
         <div id="log"></div>
@@ -169,6 +178,12 @@ export const ui = {
           <label>Pairing code<input id="pair" inputmode="numeric" placeholder="6-digit code from ./run.sh pair"></label>
           <label>…or relay token<input id="token" type="password" placeholder="(stored on this phone)"></label>
           <button id="save">Save &amp; reconnect</button>
+          <div class="pingset">
+            <h2>Ping</h2>
+            <label>Message sent by Ping (phone button, or hold a bot on the glasses list)<textarea id="pingtext" maxlength="500" rows="2"></textarea></label>
+            <div class="row"><button class="primary" id="pingsave">Save ping message</button><button id="pingreset">Default</button></div>
+            <small id="pingstatus">At most one ping per bot every 30 s. A busy bot is not pinged: you see its status and can queue one ping for when it is idle.</small>
+          </div>
           <div class="stt hidden" id="stt">
             <h2>Voice · speech-to-text</h2>
             <label>Provider<select id="sttprov"></select></label>
@@ -230,7 +245,19 @@ export const ui = {
       else return
       dirty = true; this.drawActions()
     }
-    $('list').onclick = (e) => { const row = (e.target as HTMLElement).closest('.c') as HTMLElement | null; if (row?.dataset.name) h.onPickBot(row.dataset.name) }
+    $('list').onclick = (e) => {
+      const pg = (e.target as HTMLElement).closest('button[data-ping]') as HTMLElement | null
+      if (pg) { e.stopPropagation(); h.onPing?.(pg.dataset.ping!); return }
+      const row = (e.target as HTMLElement).closest('.c') as HTMLElement | null; if (row?.dataset.name) h.onPickBot(row.dataset.name)
+    }
+    $('ping').onclick = () => h.onPing?.(h.state.bot)
+    $<HTMLTextAreaElement>('pingtext').value = h.pingText?.() ?? ''
+    $('pingsave').onclick = async () => {
+      await h.onSavePing?.($<HTMLTextAreaElement>('pingtext').value)
+      $<HTMLTextAreaElement>('pingtext').value = h.pingText?.() ?? ''
+      $('pingstatus').textContent = 'Saved ✓'
+    }
+    $('pingreset').onclick = () => { $<HTMLTextAreaElement>('pingtext').value = h.defaultPing ?? '' }
     $<HTMLInputElement>('relay').value = h.cfg.relayUrl
     if (!h.cfg.token) this.show('settings') // not paired yet: start on Settings (relay URL + pairing code)
     $('send').onclick = () => {
@@ -325,6 +352,7 @@ export const ui = {
       const img = $<HTMLImageElement>('cav')
       if (c && img.dataset.for !== c.name) { img.dataset.for = c.name; img.removeAttribute('src'); avatarUrl(c.avatar).then((u) => { if (u && img.dataset.for === c.name) img.src = u }) }
       $('talk').textContent = S.phase === 'listening' ? '■ Stop & send' : '🎙 Talk'
+      $('ping').textContent = pingLabel(S, S.bot, true)
       $('hud').textContent = S.pages[S.page] ?? ''
     } else this.drawList(S)
   },
@@ -334,7 +362,7 @@ export const ui = {
       : (c.unread ?? 0) > 1 ? `<span class="cnt" title="new messages">${c.unread}</span>` : '<span class="dot" title="new messages"></span>'
     const list = $('list'); if (!list) return
     const unread = (c: Conversation) => !!c.last && c.last.role === 'bot' && c.last.at > (S.seen[c.name] ?? 0)
-    const sig = JSON.stringify(S.convs.map((c) => [c.name, c.last?.at, unread(c), c.unread, c.attn || c.last?.attn, S.working?.[c.name]])) + Math.floor(Date.now() / 60000)
+    const sig = JSON.stringify(S.convs.map((c) => [c.name, c.last?.at, unread(c), c.unread, c.attn || c.last?.attn, S.working?.[c.name], S.pending === c.name])) + Math.floor(Date.now() / 60000)
     if (list.dataset.sig === sig) return
     list.dataset.sig = sig
     list.innerHTML = S.convs.map((c) => {
@@ -343,7 +371,7 @@ export const ui = {
       const letter = esc((c.name.match(/[A-Za-z]/)?.[0] ?? '?').toUpperCase())
       return `<div class="c" data-name="${esc(c.name)}"><div class="ph" data-av="${esc(c.avatar)}">${letter}</div>
         <div class="mid"><div class="top"><span class="nm">${esc(c.name)}${S.working?.[c.name] ? ' <span class="wk">working…</span>' : ''}</span><span class="tm${u ? ' new' : ''}">${c.last ? relTime(c.last.at) : ''}</span></div>
-        <div class="pv">${esc(prev)}</div></div>${badge(c, u)}</div>`
+        <div class="pv">${esc(prev)}</div></div><button class="pg${S.pending === c.name ? ' q' : ''}" data-ping="${esc(c.name)}" title="Ask for a short status update">${pingLabel(S, c.name, false)}</button>${badge(c, u)}</div>`
     }).join('')
     // Swap monogram placeholders for the real avatars once fetched (token-auth, cached as blob URLs).
     list.querySelectorAll<HTMLElement>('.ph[data-av]').forEach((ph) => {

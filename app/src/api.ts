@@ -53,8 +53,8 @@ export const api = {
   conversations: () => call<{ conversations: Conversation[]; default: string }>('/conversations', {}, 20_000),
   history: (bot: string) => call<{ messages: Msg[] }>(`/history?bot=${encodeURIComponent(bot)}`, {}, 20_000),
   // wait 85s keeps us under Cloudflare's ~100 s proxy timeout; longer turns come back "running"
-  chat: (bot: string, text: string) =>
-    call<ChatResult>('/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot, text, wait: 85 }) }),
+  chat: (bot: string, text: string, ping = false) =>
+    call<ChatResult>('/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot, text, wait: 85, ...(ping ? { ping } : {}) }) }),
   seen: (bot: string, at = Date.now()) =>
     call<{ bot: string; unread: number }>('/seen', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot, at }) }, 15_000),
   check: (bot: string, wait = 25) =>
@@ -79,16 +79,16 @@ export type StreamEvent =
   | { type: 'earlier'; texts: string[] }
 
 /** POST /chat/stream and parse the SSE body incrementally (EventSource cannot POST or send headers). */
-export async function chatStream(bot: string, text: string, onEvent: (e: StreamEvent) => void): Promise<void> {
+export async function chatStream(bot: string, text: string, onEvent: (e: StreamEvent) => void, ping = false): Promise<void> {
   const r = await fetch(cfg.relayUrl.replace(/\/$/, '') + '/chat/stream', {
     method: 'POST',
     headers: { authorization: `Bearer ${cfg.token}`, 'content-type': 'application/json', accept: 'text/event-stream' },
-    body: JSON.stringify({ bot, text }),
+    body: JSON.stringify({ bot, text, ...(ping ? { ping } : {}) }),
     signal: AbortSignal.timeout(11 * 60_000),
   })
   if (!r.ok || !r.body) {
     const j: any = await r.json().catch(() => ({}))
-    throw Object.assign(new Error(j.error ?? `HTTP ${r.status}`), { status: r.status })
+    throw Object.assign(new Error(j.error ?? `HTTP ${r.status}`), { status: r.status, body: j })
   }
   await readSse(r.body, (event, data) => onEvent({ type: event, ...data } as StreamEvent))
 }
@@ -122,10 +122,10 @@ async function readSse(body: ReadableStream<Uint8Array>, onFrame: (event: string
 // ── Live updates: GET /events (the relay's background sync of every bot + relay turns), read with fetch so the
 // bearer token can be sent. Reconnects with backoff and resumes with Last-Event-ID.
 export type RelayEvent =
-  | { type: 'hello'; boot: string; now: number; intervalMs: number; bots: Record<string, { busy: boolean; working: boolean }> }
+  | { type: 'hello'; boot: string; now: number; intervalMs: number; bots: Record<string, { busy: boolean; working: boolean; since?: number }> }
   | { type: 'message'; bot: string; origin: 'sync' | 'relay' | 'earlier'; msg: Msg }
   | { type: 'unread'; bot: string; unread: number; attn?: boolean }
-  | { type: 'bot-status'; bot: string; busy: boolean; working: boolean; source: string }
+  | { type: 'bot-status'; bot: string; busy: boolean; working: boolean; since?: number; source: string }
   | { type: 'reset'; reason: string }
 export function connectEvents(onEvent: (e: RelayEvent) => void, onState: (connected: boolean) => void): () => void {
   let stop = false, lastId = '', delay = 1000, ctl: AbortController | null = null
@@ -157,8 +157,8 @@ export function connectEvents(onEvent: (e: RelayEvent) => void, onState: (connec
 }
 
 /** Ask, then keep polling /check while the bot is still working (up to ~10 min). */
-export async function askAndWait(bot: string, text: string, onProgress?: (partial: string) => void): Promise<string> {
-  let r = await api.chat(bot, text)
+export async function askAndWait(bot: string, text: string, onProgress?: (partial: string) => void, ping = false): Promise<string> {
+  let r = await api.chat(bot, text, ping)
   let reply = r.reply ?? ''
   const deadline = Date.now() + 10 * 60_000
   while (r.status === 'running' && Date.now() < deadline) {
