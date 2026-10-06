@@ -13,7 +13,7 @@
 //   POST /chat/stream {bot,text}      -> text/event-stream: status | message {index,text,ms} | done | error
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, statSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, statSync, rmSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
@@ -66,6 +66,48 @@ type Msg = { role: "user" | "bot" | "system"; text: string; at: number };
 const histPath = (bot: string) => join(HISTORY_DIR, bot.replace(/[^A-Za-z0-9_-]/g, "_") + ".json");
 function history(bot: string): Msg[] { try { return JSON.parse(readFileSync(histPath(bot), "utf8")); } catch { return []; } }
 function pushHistory(bot: string, m: Msg) { const h = history(bot); h.push(m); writeFileSync(histPath(bot), JSON.stringify(h.slice(-200))); }
+
+// ---------- quick actions (predefined messages, edited on the phone, fired from the glasses) ----------
+type Action = { id: string; label: string; bot: string; text: string };
+const ACTIONS_FILE = process.env.ACTIONS_FILE ?? join(DATA_DIR, "actions.json");
+const ACTIONS_EXAMPLE = join(ROOT, "actions.example.json");
+const ACTION_LIMITS = { max: 50, label: 24, text: 2000 };
+function loadActions(): Action[] {
+  try { return JSON.parse(readFileSync(ACTIONS_FILE, "utf8")).actions ?? []; } catch {}
+  // First run: seed from actions.example.json, keeping only actions whose bot exists.
+  try { return validateActions(JSON.parse(readFileSync(ACTIONS_EXAMPLE, "utf8")).actions ?? [], true); } catch { return []; }
+}
+/** Validate a client-supplied list. Throws a 400 with a readable message; `lenient` drops bad entries instead. */
+function validateActions(input: unknown, lenient = false): Action[] {
+  const bad = (m: string) => Object.assign(new Error(m), { status: 400 });
+  if (!Array.isArray(input)) throw bad("actions must be an array");
+  if (input.length > ACTION_LIMITS.max) throw bad(`at most ${ACTION_LIMITS.max} actions`);
+  const out: Action[] = [], ids = new Set<string>();
+  input.forEach((a: any, i: number) => {
+    try {
+      if (!a || typeof a !== "object") throw bad(`action ${i + 1}: not an object`);
+      const label = String(a.label ?? "").replace(/\s+/g, " ").trim();
+      const text = String(a.text ?? "").replace(/\r\n?/g, "\n").trim();
+      const b = findBot(String(a.bot ?? ""));
+      if (!label) throw bad(`action ${i + 1}: label required`);
+      if ([...label].length > ACTION_LIMITS.label) throw bad(`action ${i + 1}: label longer than ${ACTION_LIMITS.label} characters`);
+      if (!text) throw bad(`action ${i + 1}: message required`);
+      if ([...text].length > ACTION_LIMITS.text) throw bad(`action ${i + 1}: message longer than ${ACTION_LIMITS.text} characters`);
+      if (!b) throw bad(`action ${i + 1}: unknown bot "${String(a.bot ?? "").slice(0, 40)}"`);
+      let id = /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id ?? "")) ? String(a.id) : "";
+      while (!id || ids.has(id)) id = Math.random().toString(36).slice(2, 10);
+      ids.add(id);
+      out.push({ id, label, bot: b.name, text });
+    } catch (e) { if (!lenient) throw e; }
+  });
+  return out;
+}
+function saveActions(list: Action[]) {
+  mkdirSync(dirname(ACTIONS_FILE), { recursive: true });
+  const tmp = `${ACTIONS_FILE}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ actions: list, updatedAt: Date.now() }, null, 2));
+  renameSync(tmp, ACTIONS_FILE);
+}
 
 // ---------- BDK tool calls ----------
 async function bdkTool(name: string, input: unknown, timeoutMs = 660_000) {
@@ -142,7 +184,7 @@ function transcribeWhisper(wav: Buffer, lang?: string): Promise<string> {
 // ---------- HTTP ----------
 const CORS = {
   "access-control-allow-origin": "*", // Even app WebView origin is not fixed; auth is the bearer token
-  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-methods": "GET, POST, PUT, OPTIONS",
   "access-control-allow-headers": "Authorization, Content-Type, X-Lang",
   "access-control-max-age": "86400",
 };
@@ -277,6 +319,18 @@ http.createServer(async (req, res) => {
       if (!b) return send(res, 404, { error: "unknown bot" });
       return send(res, 200, { bot: b.name, messages: history(b.name) });
     }
+    if (url.pathname === "/actions") {
+      if (req.method === "GET") return send(res, 200, { actions: loadActions(), limits: ACTION_LIMITS });
+      if (req.method === "PUT") {
+        let body: any;
+        try { body = JSON.parse((await readBody(req, 512 * 1024)).toString() || "{}"); } catch { return send(res, 400, { error: "invalid JSON" }); }
+        const list = validateActions(body.actions);
+        saveActions(list);
+        log("actions saved", list.length);
+        return send(res, 200, { actions: list, limits: ACTION_LIMITS });
+      }
+      return send(res, 405, { error: "GET or PUT" });
+    }
     if (req.method === "POST" && url.pathname === "/stt") {
       const audio = await readBody(req);
       if (audio.length < 3200) return send(res, 400, { error: "audio too short" });
@@ -361,6 +415,7 @@ http.createServer(async (req, res) => {
           return send(res, 200, { bot: b.name, status: r.status, reply, latencyMs: Date.now() - t0 });
         } finally { busy.delete(b.name); }
       }
+      if (busy.has(b.name)) return send(res, 200, { bot: b.name, status: "running", reply: "", latencyMs: 0, note: "turn in progress (streaming)" });
       const r = await bdkTool("grokbot__check", { agent: b.name, wait_seconds: Math.min(wait, 60) });
       const reply = replyText(r);
       if (reply) pushHistory(b.name, { role: "bot", text: reply, at: Date.now() });

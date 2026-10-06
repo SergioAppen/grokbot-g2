@@ -3,7 +3,9 @@
 .env.*
 !.env.example
 bots.json
+# relay state: history, avatars, pair.json, actions.json (quick actions)
 data/
+data/actions.json
 avatars-src/
 qr/
 # runtime

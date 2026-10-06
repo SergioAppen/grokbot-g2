@@ -154,7 +154,7 @@ mock() {
   python3 tools/mock-history.py "$ROOT/test/mock-data/history"
   BOTS_FILE="$ROOT/test/mock-data/bots.json" DATA_DIR="$ROOT/test/mock-data" python3 tools/avatars.py >/dev/null
   stop_one mock-relay; stop_one mock-bdk
-  launch mock-bdk node tools/mock-bdk.mjs
+  MOCK_PASSIVE="${MOCK_PASSIVE:-1}" launch mock-bdk node tools/mock-bdk.mjs
   BOTS_FILE="$ROOT/test/mock-data/bots.json" DATA_DIR="$ROOT/test/mock-data" RELAY_PORT=8799 BDK_PORT=3199 TUNNEL_MODE=none \
     launch mock-relay node --experimental-strip-types --no-warnings relay/server.ts
   sleep 1.5; printf "mock relay http://127.0.0.1:8799 /health: "; curl -s http://127.0.0.1:8799/health; echo

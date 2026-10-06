@@ -1,0 +1,8 @@
+{
+  "actions": [
+    { "id": "flight", "label": "Flight status", "bot": "Assistant", "text": "Check the status of my flight today" },
+    { "id": "projects", "label": "Check projects", "bot": "Research", "text": "Check projects" },
+    { "id": "markets", "label": "Market close", "bot": "Finance", "text": "Give me a two-line summary of today's market close" },
+    { "id": "brief", "label": "Daily brief", "bot": "Assistant", "text": "What's on my plate today? Keep it short." }
+  ]
+}

@@ -105,6 +105,17 @@ README.md for background. Follow the steps in order and run the verification che
   contain bot names and timings.
 - Health check you can run any time: `./run.sh status`.
 
+## Using it (tell the user)
+
+- Glasses: tap a conversation to **read** it (history first, starting at the first unread message). Swipe ▲▼ to
+  page through messages; **tap** to talk (tap again to send), **double-tap** to go back (or cancel while
+  listening), **hold** for push-to-talk. The footer always shows the gestures. `↓ n new` means messages arrived
+  below where you are reading.
+- Quick actions: phone → **⚡ Quick actions** to add/edit/reorder/delete (label ≤ 24, message ≤ 2000, ≤ 50
+  actions); glasses → conversation list → **Quick actions** → tap one to send it. Stored in `data/actions.json`
+  (seeded from `actions.example.json` on first run). Never fire a quick action yourself against real bots while
+  testing; use `./run.sh mock`.
+
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
@@ -114,5 +125,7 @@ README.md for background. Follow the steps in order and run the verification che
 | App says NOT PAIRED / 401 | Pair again; check that the app's relay URL matches `RELAY_PUBLIC_URL` (Settings) |
 | `409 … still working on an earlier message` | Bot busy (maybe in the desktop app); nothing was sent |
 | `bdk did not come up` | `logs/bdk.log`; usually a missing/invalid `CURSOR_API_KEY` or Node < 22.13 |
+| HUD text cut off / scrollbar on a page | Should not happen since v0.4.0 (measured-width pagination); report the message text. `app/src/paginate.ts` `HUD_LAYOUT` holds the margins |
+| Quick action save fails with 400 | The message says which action: label > 24, message > 2000, > 50 actions, or a bot not in `bots.json` |
 | STT 503 | `STT_PROVIDER` / key / `WHISPER_MODEL` path not set |
 | A new empty bot appeared in Grok Bot | A misspelled name in `bots.json`: fix the name, `./run.sh restart-relay`, and tell the user so they can delete the extra bot |

@@ -1,0 +1,46 @@
+# Weekly summary
+
+Here is the **full rundown** of everything that happened this week, with links so you can dig in later. It is intentionally long so the glasses have to paginate it across many pages without losing a single word.
+
+## Highlights
+- Shipped the new *pagination* engine for the HUD, which measures real glyph widths instead of counting characters.
+- Fixed the relay so that `/chat/stream` keeps polling even if the phone disconnects mid-turn.
+- Reviewed the documentation at https://example.com/docs/even-realities/g2/display/text-containers/content-limits?section=overflow&version=0.9.5#behaviour and added notes.
+  - Nested item: the firmware font has no bold or italic, so markdown markers are stripped.
+  - Another nested item with a path: /home/user/projects/grokbot-g2/app/src/paginate.ts
+1. Numbered step one: build the app with npm run build.
+2. Numbered step two: pack it with evenhub pack app.json dist -o grokbot-g2.ehpk.
+3. Numbered step three: upload the package and scan the QR code.
+
+> A quoted line from the release notes: every message must be fully readable on the glasses.
+
+| Item | Status |
+|------|--------|
+| Pagination | done |
+| Quick actions | done |
+
+Supercalifragilisticexpialidociousandthensomemorelettersthatneverend is a deliberately unbreakable word, and so is ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.
+
+WIDE UPPERCASE TEXT LIKE THIS USES MORE PIXELS PER CHARACTER THAN LOWERCASE TEXT DOES, WHICH IS WHY COUNTING CHARACTERS IS NOT ENOUGH WHEN YOU SPLIT PAGES FOR A FIXED-WIDTH DISPLAY.
+
+Numbers too: 1234567890 9876543210 5555555555 0000000000 1212121212 3434343434 5656565656 7878787878.
+
+Another long link: https://maps.example.org/directions/from/Plaza-Mayor-Madrid/to/Barcelona-Sants-Station/via/Zaragoza?mode=train&depart=2026-10-06T08:30:00%2B02:00&lang=en
+
+## Travel notes
+The train leaves at 08:30 from platform 7. Bring the charger for the glasses, the spare battery case and the printed booking reference, just in case the phone runs out of power halfway through the trip.
+- Carriage 4, seat 12A (window), quiet zone.
+- Connection in Zaragoza: 14 minutes, same platform.
+- Hotel check-in from 15:00; late check-out requested until 13:00.
+
+## Reading list
+1. "Designing for tiny displays" — a long essay about information density on head-mounted screens.
+2. "Latency budgets for voice assistants" — why every 100 ms matters.
+3. "Pagination patterns" — when to split by words, when to hard-break, and how to show progress.
+
+Things still open:
+- Test on real glasses with a very long reply.
+- Confirm the "new" hint appears when a message arrives while reading an earlier page.
+- Make sure swiping up goes back to the previous page and then to the previous message.
+
+That's everything for now. The very last words of this message are: purple elephant finale.

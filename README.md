@@ -9,13 +9,21 @@ named tunnel) lets the phone reach that relay.
 
 > Status: personal project / prototype. Not affiliated with Even Realities or Cursor.
 
-| Phone: conversations | Phone: chat (streamed messages) |
-|---|---|
-| ![Phone conversation list](docs/screenshots/phone-conversations.png) | ![Phone chat](docs/screenshots/phone-chat.png) |
-
-| HUD: conversations | HUD: streaming ("… more coming") | HUD: reply page |
+| Phone: conversations | Phone: quick actions editor | Phone: chat (streamed messages) |
 |---|---|---|
-| ![HUD conversation list](docs/screenshots/hud-conversations.png) | ![HUD streaming](docs/screenshots/hud-streaming.png) | ![HUD reply](docs/screenshots/hud-reply.png) |
+| ![Phone conversation list](docs/screenshots/phone-conversations.png) | ![Phone quick actions editor](docs/screenshots/phone-quick-actions.png) | ![Phone chat](docs/screenshots/phone-chat.png) |
+
+| HUD: conversations (+ Quick actions) | HUD: quick actions | HUD: read view |
+|---|---|---|
+| ![HUD conversation list](docs/screenshots/hud-conversations.png) | ![HUD quick actions list](docs/screenshots/hud-quick-actions.png) | ![HUD read view](docs/screenshots/hud-read-view.png) |
+
+| HUD: long message, page 1/12 | HUD: long message, page 3/12 (URL + list) | HUD: long message, last page 12/12 |
+|---|---|---|
+| ![HUD long message page 1](docs/screenshots/hud-long-p1.png) | ![HUD long message page 3](docs/screenshots/hud-long-p3.png) | ![HUD long message last page](docs/screenshots/hud-long-last.png) |
+
+| HUD: streaming ("… more coming") | HUD: "↓ 1 new" while reading back | HUD: bot busy (409) |
+|---|---|---|
+| ![HUD streaming](docs/screenshots/hud-streaming.png) | ![HUD new-message hint](docs/screenshots/hud-new-hint.png) | ![HUD busy](docs/screenshots/hud-busy.png) |
 
 <sub>Screenshots come from the Even Hub simulator running the bundled mock bot (`./run.sh mock`). The bot names and avatars are generated examples.</sub>
 
@@ -23,14 +31,23 @@ named tunnel) lets the phone reach that relay.
 
 - **Conversation list** on the HUD and the phone. Each row has an avatar, the bot name, a preview of the last
   message, a relative time and an unread dot. On the HUD you swipe to move and tap to open; 4 rows per screen.
+  The first HUD row is **Quick actions**.
 - **Avatars:** your own pictures (`avatars-src/<Bot>.png`) or a generated coloured shape with the bot's initial.
   The phone gets a 96 px colour version and the HUD a 40 px 4-bit greyscale dithered version.
 - **Voice:** push-to-talk from the glasses mic (or the phone mic). The relay transcribes the 16 kHz PCM with
   **ElevenLabs Scribe** or a local **whisper.cpp**.
 - **Streaming per message:** a bot's ack, progress updates and final answer each arrive as soon as they are sent
   (SSE from `POST /chat/stream`). The HUD shows "… more coming" until the turn ends.
-- **Paging:** long replies are split into ~400-character HUD pages (swipe up/down). Each new message starts on a
-  new page.
+- **Read view + full pagination:** opening a conversation shows its history first, starting at the first unread
+  message; nothing records until you tap. Every message is split into HUD pages by *measured glyph widths* (the
+  firmware font was measured in the simulator, see `app/src/glyphs.ts`) with explicit line breaks, a safety margin
+  and a 900-byte cap, so no page can overflow and the last page always ends with the message's last words.
+  Markdown is turned into drawable plain text (bullets, links, tables, headings; emoji removed). The header shows
+  `Bot · msg 2/3 · p 1/4`. Messages that arrive while you read an earlier page don't move you; the footer shows
+  `↓ n new` instead.
+- **Quick actions:** predefined messages (label, target bot, text) that you edit on the phone and fire from the
+  glasses with one tap, no speaking. Stored on the relay (`data/actions.json`, `GET/PUT /actions`), cached on the
+  phone. The reply streams into that bot's read view.
 - **Typed chat** with history on the phone screen, plus *Check reply*, *Interrupt* and *Re-ask* (glasses menu).
 - **Security:** bearer-token auth on every API route, one-time 6-digit **pairing codes** so the token never sits in
   the app package, per-IP and global **rate limits**, and lockout after repeated bad tokens.
@@ -138,6 +155,31 @@ On the phone screen open **Settings → Pairing code**, enter the code, then tap
 exchanges the code for the token once (`POST /pair`) and stores it in the Even app's local storage. Repeated
 wrong codes or tokens trigger rate limiting.
 
+## Glasses gestures
+
+| Screen | Swipe ▲ / ▼ | Tap | Double-tap | Hold |
+|---|---|---|---|---|
+| Conversation list | move selection | open (Quick actions or a bot's read view) | exit dialog | – |
+| Read view | previous / next page, then previous / next message | start talking (tap again to send) | back to the list | push-to-talk (release sends) |
+| While listening | – | send | cancel | – |
+| Quick actions | move selection | send that message to its bot | back to the list | – |
+
+The read view never starts the microphone on its own; the footer always shows the available actions
+(`Tap: talk   ▲▼ read   2xTap: list`). The glasses menu (Even's context menu) adds *Bot list*, *Check for reply*,
+*Interrupt bot*, *Re-ask last*, *Mic: glasses/phone* and *Quick actions*.
+
+## Quick actions
+
+On the phone: **⚡ Quick actions** → *+ Add action* → label (≤ 24 characters, shown on the HUD), bot, message
+(≤ 2000 characters) → **Save**. ▲ ▼ reorder, *Delete* removes, *Send* fires it right away. Up to 50 actions.
+On the glasses: conversation list → **Quick actions** (top row) → swipe to one (`Flight status > Assistant`) →
+tap. The HUD switches to that bot's read view and streams the reply. If the bot is still busy with an earlier
+message (409), the read view says so; nothing is sent.
+
+The list lives in `data/actions.json` on the relay (git-ignored); on first run it is seeded from
+`actions.example.json`, keeping only actions whose bot exists in `bots.json`. The relay validates every save
+(array of ≤ 50, label ≤ 24, message ≤ 2000, known bot, 512 KB body cap).
+
 ## Relay API (summary)
 
 All routes need `Authorization: Bearer <RELAY_TOKEN>` except `GET /health`, `GET /app/*` and `POST /pair`.
@@ -146,8 +188,9 @@ All routes need `Authorization: Bearer <RELAY_TOKEN>` except `GET /health`, `GET
 |---|---|
 | `GET /conversations` | Per bot: last message, time, count, avatar URLs (newest first) |
 | `GET /bots`, `GET /history?bot=` | Bot list; per-bot history |
+| `GET /actions` / `PUT /actions {actions:[{id?,label,bot,text}]}` | Quick actions (validated, stored in `data/actions.json`) |
 | `POST /chat/stream {bot,text}` | SSE: `status`, one `message {index,text,ms}` per bot message, `done`, `error` |
-| `POST /chat {bot,text,wait?}` / `POST /check {bot}` | Non-streaming ask / poll for more |
+| `POST /chat {bot,text,wait?}` / `POST /check {bot,wait?}` | Non-streaming ask / poll for more (the read view also uses `check` to pick up messages a bot sent on its own; it returns nothing while a stream for that bot is running) |
 | `POST /interrupt {bot}` | Interrupt the bot's current turn |
 | `POST /stt` | Raw 16 kHz s16le mono PCM or WAV → `{text}` |
 | `GET /avatars/<name>.png`, `/avatars/<name>.hud.png` | Phone / HUD avatars |
@@ -177,6 +220,8 @@ tail -f logs/relay.log logs/bdk.log
 
 ## Known limitations
 
+- **Font metrics come from the simulator:** glyph widths were measured in Even Hub simulator 0.9.5. Pages keep a
+  24 px width margin and use 7 of the 8 lines that fit, in case the hardware font differs slightly.
 - **No audio output:** the G2 has no speaker, so replies are text only.
 - **History only covers this app:** previews and history come from the relay's own log, so messages you
   exchange with a bot in the Grok Bot desktop app don't appear (except replies that arrive during a G2 turn).
@@ -191,7 +236,11 @@ tail -f logs/relay.log logs/bdk.log
 
 ## Development and testing
 
-- Mock stack: `./run.sh mock` (fake `grokbot__*` tools; every message gets a 3-message reply over 12 s).
+- Mock stack: `./run.sh mock` (fake `grokbot__*` tools; every message gets a 3-message reply over 12 s, a message
+  containing "long" gets one ~3000-character reply, and the first check per bot returns one "passive" message).
+- Pagination self-test: `cd app && npx esbuild test/paginate.test.ts --bundle --platform=node --format=esm
+  --loader:.txt=text --outfile=/tmp/pt.mjs && node /tmp/pt.mjs` (every page fits, no text lost, last words on
+  the last page).
 - Simulator (Linux, headless): `tools/sim.sh start` → `tools/sim-pair.sh` → automation API on `:9898`
   (`/api/screenshot/glasses`, `/api/input`). Convert glasses screenshots with `tools/hudview.py`.
 - Typecheck: `(cd relay && npm run check)`, `(cd relay/bdk && npm run check)`, `(cd app && npm run build)`.

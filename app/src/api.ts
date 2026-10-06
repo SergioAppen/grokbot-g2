@@ -9,6 +9,9 @@ export type Conversation = {
   avatar: string; hudAvatar: string
 }
 
+export type Action = { id: string; label: string; bot: string; text: string }
+export const ACTION_LIMITS = { max: 50, label: 24, text: 2000 }
+
 export const cfg = { relayUrl: '', token: '' }
 
 async function call<T>(path: string, init: RequestInit = {}, timeoutMs = 100_000): Promise<T> {
@@ -35,13 +38,16 @@ export const api = {
   bots: () => call<{ bots: Bot[]; default: string }>('/bots', {}, 20_000),
   conversations: () => call<{ conversations: Conversation[]; default: string }>('/conversations', {}, 20_000),
   history: (bot: string) => call<{ messages: Msg[] }>(`/history?bot=${encodeURIComponent(bot)}`, {}, 20_000),
-  // wait 85 s stays under common proxy timeouts (Cloudflare ~100 s); longer turns come back "running"
+  // wait 85s keeps us under Cloudflare's ~100 s proxy timeout; longer turns come back "running"
   chat: (bot: string, text: string) =>
     call<ChatResult>('/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot, text, wait: 85 }) }),
   check: (bot: string, wait = 25) =>
     call<ChatResult>('/check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot, wait }) }, 60_000),
   interrupt: (bot: string) =>
     call<{ ok: boolean }>('/interrupt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bot }) }, 40_000),
+  actions: () => call<{ actions: Action[] }>('/actions', {}, 20_000),
+  saveActions: (actions: Action[]) =>
+    call<{ actions: Action[] }>('/actions', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ actions }) }, 20_000),
   stt: (pcm: Uint8Array) =>
     call<{ text: string }>('/stt', { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: new Blob([pcm as BlobPart], { type: 'application/octet-stream' }) }, 70_000),
 }
