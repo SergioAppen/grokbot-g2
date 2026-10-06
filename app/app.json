@@ -1,0 +1,28 @@
+{
+  "package_id": "com.example.grokbotg2",
+  "edition": "202601",
+  "name": "Grok Bot G2",
+  "version": "0.3.0",
+  "min_sdk_version": "0.0.14",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "g2-microphone",
+      "desc": "Push-to-talk: records your question from the glasses mic, sent to your own relay for transcription."
+    },
+    {
+      "name": "phone-microphone",
+      "desc": "Optional push-to-talk from the phone screen when the glasses mic is not used."
+    },
+    {
+      "name": "network",
+      "desc": "Talks to your own Grok Bot relay (speech-to-text and bot replies).",
+      "whitelist": [
+        "https://your-relay.example.com"
+      ]
+    }
+  ],
+  "supported_languages": [
+    "en"
+  ]
+}

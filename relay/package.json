@@ -1,0 +1,14 @@
+{
+  "name": "grokbot-g2-relay",
+  "private": true,
+  "type": "module",
+  "description": "Grok Bot G2 relay (no runtime dependencies; runs with node --experimental-strip-types).",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "start": "node --experimental-strip-types --no-warnings server.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "typescript": "^5.7.0"
+  }
+}

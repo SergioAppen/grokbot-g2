@@ -1,0 +1,8 @@
+[
+  {"name": "Assistant", "avatarShape": "hex",      "avatarColor": "cyan"},
+  {"name": "Research",  "avatarShape": "cloud",    "avatarColor": "violet"},
+  {"name": "Finance",   "avatarShape": "pebble",   "avatarColor": "green"},
+  {"name": "Writer",    "avatarShape": "teardrop", "avatarColor": "orange"},
+  {"name": "Planner",   "avatarShape": "squircle", "avatarColor": "blue"},
+  {"name": "Coder",     "avatarShape": "tablet",   "avatarColor": "red"}
+]

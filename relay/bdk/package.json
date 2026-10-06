@@ -1,0 +1,17 @@
+{
+  "name": "grokbot-g2-bdk",
+  "private": true,
+  "type": "module",
+  "description": "bdk project that exposes the Grok Bot agents extension to the G2 relay.",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "serve": "bdk serve --dir . --mode single"
+  },
+  "dependencies": {
+    "@cursor/bdk": "^0.2.18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "typescript": "6.0.3"
+  }
+}

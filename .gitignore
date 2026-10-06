@@ -1,0 +1,24 @@
+# secrets & personal data
+.env
+.env.*
+!.env.example
+bots.json
+data/
+avatars-src/
+qr/
+# runtime
+logs/
+run/
+relay/bdk/.agent-serve/
+test/mock-data/
+test/sim/
+# builds & deps
+node_modules/
+dist/
+*.ehpk
+app/.env.production
+# local tool installs
+.node/
+tailscale/
+whisper.cpp/
+__pycache__/
